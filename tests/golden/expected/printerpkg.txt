@@ -1,0 +1,16 @@
+1 + 2 * 3
+fmt.Println(a, b + 1)
+true
+package main
+
+func add(a int, b int) int {
+	if a > b {
+		return a
+	}
+	sum := a + b
+	for sum > 0 {
+		sum--
+	}
+	return sum
+}
+

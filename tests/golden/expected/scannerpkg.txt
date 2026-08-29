@@ -1,0 +1,64 @@
+IDENT x
+:=
+INT 1
++
+INT 2
+; 
+
+EOF
+---
+func func
+IDENT add
+(
+IDENT a
+,
+IDENT b
+IDENT int
+)
+IDENT int
+{
+return return
+IDENT a
++
+IDENT b
+; 
+
+}
+; 
+
+EOF
+---
+IDENT x
+:=
+INT 1
+; 
+
+IDENT y
+:=
+INT 2
+; 
+
+EOF
+---
+IDENT x
+:=
+INT 1
+; 
+
+IDENT y
+:=
+INT 2
+; 
+
+EOF
+---
+INT 0xFF
+INT 0o17
+INT 0b1010
+FLOAT 3.14
+STRING "hi"
+STRING `raw`
+CHAR 'c'
+; 
+
+EOF

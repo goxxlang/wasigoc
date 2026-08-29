@@ -1,0 +1,8 @@
+Hi =3D 100% cool=09
+trailing=20
+
+Hi = 100% cool	
+trailing 
+
+If you believe that truth=beauty, then surely 
+mathematics is the most beautiful branch of philosophy.

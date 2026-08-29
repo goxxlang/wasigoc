@@ -1,0 +1,22 @@
+
+true
+Alice
+30
+true
+4.5
+2
+true
+
+true
+{"a":1,"b":2}
+[1,"two",true,null]
+{"s":"line1\nline2\t\"q\""}
+
+line1
+line2	"q"
+
+{"X":5,"Y":7}
+
+{"Label":"origin","P":{"X":0,"Y":0}}
+true
+true

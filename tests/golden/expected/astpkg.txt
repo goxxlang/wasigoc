@@ -1,0 +1,46 @@
+true
+3
+true
+x
+int
+true
+pi
+true
+true
+true
+true
+true
+true
+3
+true
+true
+2
+true
+2
+1
+0
+package main
+
+var x int = 5
+
+const pi = 3
+
+func run() int {
+	var y = 10
+	p := &y
+	arg := []int{1, 2, 3}
+	m := map[string]int{}
+	sum := 0
+	for i, v := range arg {
+		m["k"] = i + v
+		sum = sum + v
+	}
+	switch y {
+		case 1:
+			return 1
+		default:
+			return sum
+	}
+	return *p
+}
+

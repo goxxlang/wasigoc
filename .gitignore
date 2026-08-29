@@ -1,0 +1,39 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Generated artifacts
+*_gen.cpp
+*_gen.hpp
+*.wasm
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local agent/tooling
+.claude/
+.grok/

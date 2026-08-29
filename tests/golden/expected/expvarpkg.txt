@@ -1,0 +1,10 @@
+5
+5
+wasigoc
+"wasigoc"
+0.75
+{"a": 5, "b": "wasigoc"}
+2
+true
+true
+4

@@ -1,0 +1,9 @@
+ident foo
+int 123
+float 3.14
+string "hi there"
+ident bar_2
+rawstring `raw text`
+char 'x'
+rune +
+ident baz
