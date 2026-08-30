@@ -1,4 +1,5 @@
 # wasigoc
+<img width="1408" height="768" alt="1788049219961" src="https://github.com/user-attachments/assets/3f1444b7-70d6-49a2-be85-b0c7db589ed2" />
 
 **Go++ is the language. `wasigoc` is the compiler.**
 
