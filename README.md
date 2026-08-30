@@ -6,7 +6,7 @@
 * **GitHub:** [goxxlang/wasigoc](https://github.com/goxxlang/wasigoc)
 * **License:** BSD-3-Clause (`LICENSE`)
 
-Go++ is Go *syntax* with a C++/WASM *runtime*: Oilpan GC, cooperative goroutines, and no data races. `wasigoc` reads a (restricted) `.go` file and emits C++ for [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) `wasm32-wasip1`.
+Go++ is Go *syntax* with a C++/WASM *runtime*: Oilpan GC, C++ object type identifiers for go/types, cooperative goroutines, and no data races. `wasigoc` reads a (restricted) `.go` file and emits C++ for [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) `wasm32-wasip1`.
 
 ```
 Go++ source (.go)  ──>  wasigoc  ──>  C++ (.cpp)  ──>  wasm32-wasip1-clang++  ──>  .wasm
