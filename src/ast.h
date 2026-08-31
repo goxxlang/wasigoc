@@ -25,6 +25,30 @@ enum class TypeKind {
   Array,      // [N]T
 };
 
+// Constant integer expression used as `[N]T` / `[1<<10]T` / `[Size]T`.
+// Kept separate from Expr so TypeNode can own it without an Expr cycle.
+struct ArrayLenExpr {
+  enum class Kind { Lit, Ident, Unary, Binary };
+  Kind kind = Kind::Lit;
+  int64_t lit = 0;
+  std::string ident;
+  std::string op;
+  std::unique_ptr<ArrayLenExpr> x;
+  std::unique_ptr<ArrayLenExpr> y;
+};
+
+inline std::unique_ptr<ArrayLenExpr> CloneArrayLen(const ArrayLenExpr* e) {
+  if (!e) return nullptr;
+  auto c = std::make_unique<ArrayLenExpr>();
+  c->kind = e->kind;
+  c->lit = e->lit;
+  c->ident = e->ident;
+  c->op = e->op;
+  c->x = CloneArrayLen(e->x.get());
+  c->y = CloneArrayLen(e->y.get());
+  return c;
+}
+
 struct TypeNode;
 
 struct Param {
@@ -41,10 +65,12 @@ struct TypeNode {
   std::unique_ptr<TypeNode> elem;    // Pointer/Slice/Map(value)/Chan/Array
   bool chan_send = true;             // Chan direction
   bool chan_recv = true;
-  int64_t array_len = 0;             // Array only
+  int64_t array_len = 0;             // Array only (when array_len_expr is null)
+  std::unique_ptr<ArrayLenExpr> array_len_expr;  // named const / 1<<n
   std::vector<Param> func_params;    // Func only
   std::vector<std::unique_ptr<TypeNode>> func_results;
   bool variadic = false;
+  std::vector<std::unique_ptr<TypeNode>> type_args;  // Named only: Set[int]
 };
 
 inline std::unique_ptr<TypeNode> MakeNamedType(std::string name, std::string pkg = "") {
@@ -68,6 +94,7 @@ inline std::unique_ptr<TypeNode> CloneType(const TypeNode* t) {
   c->chan_send = t->chan_send;
   c->chan_recv = t->chan_recv;
   c->array_len = t->array_len;
+  c->array_len_expr = CloneArrayLen(t->array_len_expr.get());
   c->variadic = t->variadic;
   for (auto& p : t->func_params) {
     Param np;
@@ -77,6 +104,7 @@ inline std::unique_ptr<TypeNode> CloneType(const TypeNode* t) {
     c->func_params.push_back(std::move(np));
   }
   for (auto& r : t->func_results) c->func_results.push_back(CloneType(r.get()));
+  for (auto& a : t->type_args) c->type_args.push_back(CloneType(a.get()));
   return c;
 }
 
@@ -85,6 +113,7 @@ inline std::unique_ptr<TypeNode> CloneType(const TypeNode* t) {
 enum class ExprKind {
   IntLit,
   FloatLit,
+  ImagLit,
   StringLit,
   BoolLit,
   Nil,
@@ -113,6 +142,8 @@ struct FuncLit {
 
 struct Expr {
   ExprKind kind;
+  int line = 0;
+  int col = 0;
 
   long long intval = 0;
   double floatval = 0;
@@ -140,10 +171,12 @@ struct Expr {
   std::unique_ptr<FuncLit> func_lit;
 };
 
-inline std::unique_ptr<Expr> MakeIdent(std::string name) {
+inline std::unique_ptr<Expr> MakeIdent(std::string name, int line = 0, int col = 0) {
   auto e = std::make_unique<Expr>();
   e->kind = ExprKind::Ident;
   e->strval = std::move(name);
+  e->line = line;
+  e->col = col;
   return e;
 }
 
@@ -153,6 +186,8 @@ inline std::unique_ptr<Expr> CloneExpr(const Expr* e) {
   if (!e) return nullptr;
   auto c = std::make_unique<Expr>();
   c->kind = e->kind;
+  c->line = e->line;
+  c->col = e->col;
   c->intval = e->intval;
   c->floatval = e->floatval;
   c->boolval = e->boolval;
@@ -221,6 +256,8 @@ struct SelectCase {
 
 struct Stmt {
   StmtKind kind;
+  int line = 0;
+  int col = 0;
 
   std::vector<std::string> names;
   std::unique_ptr<TypeNode> var_type;
@@ -236,6 +273,7 @@ struct Stmt {
   std::unique_ptr<Expr> range_expr;
   bool range_has_key = true;
   bool range_has_value = true;
+  bool is_const = false;
 
   std::vector<std::unique_ptr<Stmt>> body;
   std::vector<std::unique_ptr<Stmt>> else_body;
@@ -251,11 +289,13 @@ struct Stmt {
 struct FieldDecl {
   std::string name;
   std::unique_ptr<TypeNode> type;
+  std::string tag;  // raw `json:"name"` string, empty if omitted
   bool embedded = false;
 };
 
 struct StructDecl {
   std::string name;
+  std::vector<std::string> type_params;  // [T any] => "T"
   std::vector<FieldDecl> fields;
 };
 
@@ -296,12 +336,14 @@ struct GlobalVarDecl {
   int iota_value = 0;
 };
 
-// `type Name T` or `type Name = T`. Both become C++ `using` (C++ is
-// stronger here than Go's defined-type vs alias distinction).
+// `type Name T` (defined type) or `type Name = T` (alias). Defined types
+// with a method set become a distinct C++ struct (object-type identity);
+// aliases and method-less defined types stay `using`.
 struct TypeAlias {
   std::string name;
   std::unique_ptr<TypeNode> type;
   bool is_alias_eq = false;  // true for `type Name = T`
+  std::vector<std::string> type_params;
 };
 
 struct ImportSpec {
@@ -310,6 +352,7 @@ struct ImportSpec {
 };
 
 struct File {
+  std::string path;
   std::string package_name;
   std::vector<std::string> imports;  // paths, for the loader
   std::vector<ImportSpec> import_specs;

@@ -242,14 +242,75 @@ func (p *printer) printNode(n *ast.Node) {
 		return
 	}
 	if n.Kind == ast.FuncDecl {
-		p.writeString("func " + n.Name + "(")
+		p.writeString("func ")
+		if n.X != nil {
+			p.writeString("(")
+			if n.X.Name != "" {
+				p.writeString(n.X.Name + " ")
+			}
+			p.printNode(n.X.Type)
+			p.writeString(") ")
+		}
+		p.writeString(n.Name + "(")
 		p.printFieldList(n.Params)
 		p.writeString(") ")
-		if len(n.Results) == 1 {
+		if len(n.Results) == 1 && n.Results[0].Name == "" {
 			p.printNode(n.Results[0].Type)
 			p.writeString(" ")
+		} else if len(n.Results) > 0 {
+			p.writeString("(")
+			p.printFieldList(n.Results)
+			p.writeString(") ")
 		}
 		p.printNode(n.Body)
+		return
+	}
+	if n.Kind == ast.TypeSpec {
+		p.writeString("type " + n.Name)
+		if len(n.Params) > 0 {
+			p.writeString("[")
+			p.printFieldList(n.Params)
+			p.writeString("]")
+		}
+		p.writeString(" ")
+		p.printNode(n.Type)
+		return
+	}
+	if n.Kind == ast.FuncType {
+		p.writeString("func")
+		p.printFuncSig(n)
+		return
+	}
+	if n.Kind == ast.InterfaceType {
+		p.writeString("interface{")
+		for i := 0; i < len(n.List); i++ {
+			if i > 0 {
+				p.writeString("; ")
+			}
+			m := n.List[i]
+			p.writeString(m.Name)
+			if m.Type != nil && m.Type.Kind == ast.FuncType {
+				p.printFuncSig(m.Type)
+			} else {
+				p.printNode(m.Type)
+			}
+		}
+		p.writeString("}")
+		return
+	}
+	if n.Kind == ast.StructType {
+		p.writeString("struct{")
+		for i := 0; i < len(n.List); i++ {
+			if i > 0 {
+				p.writeString("; ")
+			}
+			f := n.List[i]
+			if f.Name != "" {
+				p.writeString(f.Name + " ")
+			}
+			p.printNode(f.Type)
+		}
+		p.writeString("}")
 		return
 	}
 	if n.Kind == ast.File {
@@ -273,12 +334,28 @@ func (p *printer) printExprList(list []*ast.Node) {
 	}
 }
 
+func (p *printer) printFuncSig(n *ast.Node) {
+	p.writeString("(")
+	p.printFieldList(n.Params)
+	p.writeString(")")
+	if len(n.Results) == 1 && n.Results[0].Name == "" {
+		p.writeString(" ")
+		p.printNode(n.Results[0].Type)
+	} else if len(n.Results) > 1 {
+		p.writeString(" (")
+		p.printFieldList(n.Results)
+		p.writeString(")")
+	}
+}
+
 func (p *printer) printFieldList(fields []*ast.Node) {
 	for i := 0; i < len(fields); i++ {
 		if i > 0 {
 			p.writeString(", ")
 		}
-		p.writeString(fields[i].Name + " ")
+		if fields[i].Name != "" {
+			p.writeString(fields[i].Name + " ")
+		}
 		p.printNode(fields[i].Type)
 	}
 }

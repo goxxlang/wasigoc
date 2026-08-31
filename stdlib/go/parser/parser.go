@@ -3,18 +3,18 @@
 // deliberately bounded slice of Go's grammar. Expressions: idents,
 // literals, binary/unary/paren, calls, selectors, index, composite
 // literals (`T{...}`/`[]T{...}`/`map[K]V{...}`, positional elements
-// only -- no keyed `Field: value` elements, no struct-type literals
-// since there's no struct *type* declaration parsing). Types: bare
-// identifier/`pkg.Type`, pointer (`*T`), slice (`[]T`, no fixed-size
-// `[N]T`), map (`map[K]V`) -- no struct/interface/func types. Statements:
-// expr/assign/define/incdec, if, for (3-clause/cond-only/bare/range),
-// switch (expr cases only, no type switch), return, break/continue,
-// blocks, single-spec `var`/`const` (`var x int`, `var x = 1`, `const x
-// = 1` -- no grouped `var (...)` blocks, no multi-name specs). Decls:
-// `func` with `name type` params/one result, plus top-level `var`/
-// `const`. NOT supported: type declarations, struct/interface literals,
-// select/go/defer, type switch, multi-return, generics, labeled
-// statements, goto.
+// only -- no keyed `Field: value` elements). Types: identifier/`pkg.Type`,
+// pointer (`*T`), slice (`[]T`, no fixed-size `[N]T`), map (`map[K]V`),
+// func types, struct types, interface types (method signatures), and
+// single-arg instantiation `Set[int]`. Statements: expr/assign/define/
+// incdec, if, for (3-clause/cond-only/bare/range), switch (expr cases
+// only, no type switch), return, break/continue, blocks, single-spec
+// `var`/`const`/`type`. Decls: `func` with optional receiver
+// (`func (d Duration) String() string`), `name type` params, one or
+// parenthesized results, plus top-level `var`/`const`/`type` (including
+// `type Set[T any] []T`). NOT supported: select/go/defer, type switch,
+// labeled statements, goto, grouped `var (...)` / multi-name specs,
+// multi-arg instantiations `Map[K, V]`.
 //
 // Composite literals need the same disambiguation real Go's own parser
 // has: `Ident{` after `if`/`for`/`switch` (in their init/cond/post, not
@@ -529,8 +529,13 @@ func (p *Parser) parseStmt() *ast.Node {
 	if p.tok == token.BREAK || p.tok == token.CONTINUE {
 		return p.parseBranchStmt()
 	}
-	if p.tok == token.VAR || p.tok == token.CONST {
-		n := p.parseSpecDecl()
+	if p.tok == token.VAR || p.tok == token.CONST || p.tok == token.TYPE {
+		var n *ast.Node
+		if p.tok == token.TYPE {
+			n = p.parseTypeSpec()
+		} else {
+			n = p.parseSpecDecl()
+		}
 		if p.err == nil && p.tok == token.SEMICOLON {
 			p.next()
 		}
@@ -547,8 +552,9 @@ func (p *Parser) parseStmt() *ast.Node {
 
 // parseType supports a bare identifier or a qualified `pkg.Type`
 // (flattened into one Ident node whose Name is "pkg.Type"), a pointer
-// `*T`, a slice `[]T` (no fixed-size `[N]T`), or a map `map[K]V` -- no
-// struct/interface/func types.
+// `*T`, a slice `[]T` (no fixed-size `[N]T`), a map `map[K]V`, a func
+// type, a struct type, an interface type, or a single-arg instantiation
+// `Set[int]` (IndexExpr).
 func (p *Parser) parseType() *ast.Node {
 	if p.err != nil {
 		return bad
@@ -575,13 +581,147 @@ func (p *Parser) parseType() *ast.Node {
 		val := p.parseType()
 		return &ast.Node{Kind: ast.MapType, Pos: pos, X: key, Y: val}
 	}
+	if p.tok == token.FUNC {
+		return p.parseFuncType()
+	}
+	if p.tok == token.INTERFACE {
+		return p.parseInterfaceType()
+	}
+	if p.tok == token.STRUCT {
+		return p.parseStructType()
+	}
+	return p.parseTypeName()
+}
+
+func (p *Parser) parseTypeName() *ast.Node {
 	pos := p.pos
 	name := p.expectIdent()
 	if p.err == nil && p.tok == token.PERIOD {
 		p.next()
 		name = name + "." + p.expectIdent()
 	}
-	return &ast.Node{Kind: ast.Ident, Pos: pos, Name: name}
+	n := &ast.Node{Kind: ast.Ident, Pos: pos, Name: name}
+	if p.err == nil && p.tok == token.LBRACK {
+		p.next()
+		arg := p.parseType()
+		p.expect(token.RBRACK)
+		return &ast.Node{Kind: ast.IndexExpr, Pos: pos, X: n, Y: arg}
+	}
+	return n
+}
+
+func (p *Parser) parseFuncType() *ast.Node {
+	pos := p.expect(token.FUNC)
+	p.expect(token.LPAREN)
+	params := p.parseParamList()
+	p.expect(token.RPAREN)
+	results := p.parseResults()
+	return &ast.Node{Kind: ast.FuncType, Pos: pos, Params: params, Results: results}
+}
+
+func (p *Parser) parseInterfaceType() *ast.Node {
+	pos := p.expect(token.INTERFACE)
+	p.expect(token.LBRACE)
+	var list []*ast.Node
+	for p.err == nil && p.tok != token.RBRACE && p.tok != token.EOF {
+		mpos := p.pos
+		name := p.expectIdent()
+		p.expect(token.LPAREN)
+		params := p.parseParamList()
+		p.expect(token.RPAREN)
+		results := p.parseResults()
+		ft := &ast.Node{Kind: ast.FuncType, Pos: mpos, Params: params, Results: results}
+		list = append(list, &ast.Node{Kind: ast.Field, Pos: mpos, Name: name, Type: ft})
+		if p.err == nil && p.tok == token.SEMICOLON {
+			p.next()
+		}
+	}
+	p.expect(token.RBRACE)
+	return &ast.Node{Kind: ast.InterfaceType, Pos: pos, List: list}
+}
+
+func (p *Parser) parseStructType() *ast.Node {
+	pos := p.expect(token.STRUCT)
+	p.expect(token.LBRACE)
+	var list []*ast.Node
+	for p.err == nil && p.tok != token.RBRACE && p.tok != token.EOF {
+		fpos := p.pos
+		name := p.expectIdent()
+		typ := p.parseType()
+		list = append(list, &ast.Node{Kind: ast.Field, Pos: fpos, Name: name, Type: typ})
+		if p.err == nil && p.tok == token.SEMICOLON {
+			p.next()
+		}
+	}
+	p.expect(token.RBRACE)
+	return &ast.Node{Kind: ast.StructType, Pos: pos, List: list}
+}
+
+func (p *Parser) isTypeStart() bool {
+	return p.tok == token.IDENT || p.tok == token.MUL || p.tok == token.LBRACK ||
+		p.tok == token.MAP || p.tok == token.FUNC || p.tok == token.INTERFACE ||
+		p.tok == token.STRUCT
+}
+
+func (p *Parser) parseParamList() []*ast.Node {
+	var fields []*ast.Node
+	for p.err == nil && p.tok != token.RPAREN {
+		pos := p.pos
+		if p.tok == token.IDENT {
+			name := p.lit
+			p.next()
+			if p.tok == token.PERIOD {
+				p.next()
+				q := name + "." + p.expectIdent()
+				typ := &ast.Node{Kind: ast.Ident, Pos: pos, Name: q}
+				if p.err == nil && p.tok == token.LBRACK {
+					p.next()
+					arg := p.parseType()
+					p.expect(token.RBRACK)
+					typ = &ast.Node{Kind: ast.IndexExpr, Pos: pos, X: typ, Y: arg}
+				}
+				fields = append(fields, &ast.Node{Kind: ast.Field, Pos: pos, Type: typ})
+			} else if p.tok == token.LBRACK {
+				base := &ast.Node{Kind: ast.Ident, Pos: pos, Name: name}
+				p.next()
+				arg := p.parseType()
+				p.expect(token.RBRACK)
+				typ := &ast.Node{Kind: ast.IndexExpr, Pos: pos, X: base, Y: arg}
+				fields = append(fields, &ast.Node{Kind: ast.Field, Pos: pos, Type: typ})
+			} else if p.tok == token.COMMA || p.tok == token.RPAREN {
+				fields = append(fields, &ast.Node{Kind: ast.Field, Pos: pos, Type: &ast.Node{Kind: ast.Ident, Pos: pos, Name: name}})
+			} else {
+				typ := p.parseType()
+				fields = append(fields, &ast.Node{Kind: ast.Field, Pos: pos, Name: name, Type: typ})
+			}
+		} else {
+			typ := p.parseType()
+			fields = append(fields, &ast.Node{Kind: ast.Field, Pos: pos, Type: typ})
+		}
+		if p.err == nil && p.tok == token.COMMA {
+			p.next()
+			continue
+		}
+		break
+	}
+	return fields
+}
+
+func (p *Parser) parseResults() []*ast.Node {
+	if p.err != nil {
+		return nil
+	}
+	if p.tok == token.LPAREN {
+		p.next()
+		fields := p.parseParamList()
+		p.expect(token.RPAREN)
+		return fields
+	}
+	if p.isTypeStart() {
+		typ := p.parseType()
+		return []*ast.Node{&ast.Node{Kind: ast.Field, Pos: typ.Pos, Type: typ}}
+	}
+	return nil
 }
 
 // parseSpecDecl parses a single-spec `var name [type] [= expr]` or
@@ -609,37 +749,54 @@ func (p *Parser) parseSpecDecl() *ast.Node {
 	return &ast.Node{Kind: kind, Pos: pos, Name: name, Type: typ, X: init}
 }
 
-func (p *Parser) parseFieldList() []*ast.Node {
-	var fields []*ast.Node
-	for p.err == nil && p.tok != token.RPAREN {
-		pos := p.pos
-		name := p.expectIdent()
-		typ := p.parseType()
-		fields = append(fields, &ast.Node{Kind: ast.Field, Pos: pos, Name: name, Type: typ})
-		if p.err == nil && p.tok == token.COMMA {
-			p.next()
-			continue
+func (p *Parser) parseTypeSpec() *ast.Node {
+	pos := p.expect(token.TYPE)
+	name := p.expectIdent()
+	var params []*ast.Node
+	if p.err == nil && p.tok == token.LBRACK {
+		p.next()
+		for p.err == nil && p.tok != token.RBRACK {
+			ppos := p.pos
+			pn := p.expectIdent()
+			pt := p.parseType()
+			params = append(params, &ast.Node{Kind: ast.Field, Pos: ppos, Name: pn, Type: pt})
+			if p.err == nil && p.tok == token.COMMA {
+				p.next()
+				continue
+			}
+			break
 		}
-		break
+		p.expect(token.RBRACK)
 	}
-	return fields
+	typ := p.parseType()
+	return &ast.Node{Kind: ast.TypeSpec, Pos: pos, Name: name, Params: params, Type: typ}
+}
+
+func (p *Parser) parseFieldList() []*ast.Node {
+	return p.parseParamList()
 }
 
 func (p *Parser) parseFuncDecl() *ast.Node {
 	pos := p.expect(token.FUNC)
+	var recv *ast.Node
+	if p.err == nil && p.tok == token.LPAREN {
+		p.next()
+		rpos := p.pos
+		rname := p.expectIdent()
+		rtyp := p.parseType()
+		p.expect(token.RPAREN)
+		recv = &ast.Node{Kind: ast.Field, Pos: rpos, Name: rname, Type: rtyp}
+	}
 	name := p.expectIdent()
 	p.expect(token.LPAREN)
-	params := p.parseFieldList()
+	params := p.parseParamList()
 	p.expect(token.RPAREN)
-	var results []*ast.Node
-	if p.err == nil && p.tok != token.LBRACE {
-		results = append(results, &ast.Node{Kind: ast.Field, Pos: p.pos, Type: p.parseType()})
-	}
+	results := p.parseResults()
 	body := p.parseBlockStmt()
 	if p.err == nil && p.tok == token.SEMICOLON {
 		p.next()
 	}
-	return &ast.Node{Kind: ast.FuncDecl, Pos: pos, Name: name, Params: params, Results: results, Body: body}
+	return &ast.Node{Kind: ast.FuncDecl, Pos: pos, Name: name, X: recv, Params: params, Results: results, Body: body}
 }
 
 func (p *Parser) parseFile() *ast.Node {
@@ -667,12 +824,17 @@ func (p *Parser) parseFile() *ast.Node {
 			p.next()
 		}
 	}
-	for p.err == nil && (p.tok == token.FUNC || p.tok == token.VAR || p.tok == token.CONST) {
+	for p.err == nil && (p.tok == token.FUNC || p.tok == token.VAR || p.tok == token.CONST || p.tok == token.TYPE) {
 		if p.tok == token.FUNC {
 			decls = append(decls, p.parseFuncDecl())
 			continue
 		}
-		d := p.parseSpecDecl()
+		var d *ast.Node
+		if p.tok == token.TYPE {
+			d = p.parseTypeSpec()
+		} else {
+			d = p.parseSpecDecl()
+		}
 		if p.err == nil && p.tok == token.SEMICOLON {
 			p.next()
 		}

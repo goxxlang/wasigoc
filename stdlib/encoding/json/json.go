@@ -1,18 +1,7 @@
-// Tiny subset of encoding/json: encodes/decodes the *generic* decoded-JSON
-// value shape (nil, bool, float64, int, string, []any, map[string]any) --
-// parsing arbitrary JSON into `any`/`map[string]any`/`[]any` and
-// serializing that same shape back out covers a real and common use case
-// (config files, API responses of unknown/dynamic shape). Map keys are
-// sorted when marshaling (real Go's json.Marshal does this too).
-//
-// Marshal ALSO supports arbitrary structs now, via reflect (exported
-// fields only, in declaration order -- no `json:"..."` struct tags, no
-// omitempty, since there's nowhere to parse a tag string from without a
-// real reflect.StructTag). Unmarshal does NOT support decoding into an
-// arbitrary struct pointer -- that needs settable/addressable reflect
-// Values (pointer-based field mutation), a bigger feature than the
-// read-only reflect this compiler has; only *any/*map[string]any/*[]any/
-// *string/*float64/*bool targets work.
+// Tiny subset of encoding/json. Marshal/Unmarshal the generic JSON shape
+// (nil, bool, float64, int, string, []any, map[string]any) plus structs
+// via reflect. Unmarshal into a struct pointer writes through settable
+// Values (adapt_ptr fields). Slice-of-struct Marshal uses reflect.Len/Index.
 package json
 
 import (
@@ -66,6 +55,9 @@ func marshalReflect(b []byte, v any) ([]byte, error) {
 	if k == reflect.Struct {
 		return marshalStruct(b, rv)
 	}
+	if k == reflect.Slice {
+		return marshalSlice(b, rv)
+	}
 	if k == reflect.Bool {
 		if rv.Bool() {
 			return append(b, "true"...), nil
@@ -85,7 +77,24 @@ func marshalReflect(b []byte, v any) ([]byte, error) {
 		return marshalString(b, rv.String()), nil
 	}
 	return b, errors.New("json: unsupported type for Marshal (nil/bool/numbers/string/[]any/" +
-		"map[string]any/struct -- no slice-of-struct or map-of-struct field support yet)")
+		"map[string]any/struct/slice -- no map-of-struct field support yet)")
+}
+
+func marshalSlice(b []byte, rv reflect.Value) ([]byte, error) {
+	n := rv.Len()
+	b = append(b, byte(91))
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b = append(b, byte(44))
+		}
+		nb, err := marshalValue(b, rv.Index(i).Interface())
+		if err != nil {
+			return b, err
+		}
+		b = nb
+	}
+	b = append(b, byte(93))
+	return b, nil
 }
 
 func marshalStruct(b []byte, rv reflect.Value) ([]byte, error) {
@@ -204,9 +213,8 @@ func marshalObject(b []byte, m map[string]any) ([]byte, error) {
 	return b, nil
 }
 
-// Unmarshal supports these targets (a pointer to each): any, map[string]any,
-// []any, string, float64, bool -- not an arbitrary struct pointer (needs
-// reflection to know its fields; see the package comment).
+// Unmarshal supports pointers to any, map[string]any, []any, string,
+// float64, bool, and structs (nested structs included) via reflect.
 func Unmarshal(data []byte, v any) error {
 	p := &parser{s: string(data)}
 	val, err := p.parseValue()
@@ -257,7 +265,75 @@ func Unmarshal(data []byte, v any) error {
 		*ptr = b
 		return nil
 	}
-	return errors.New("json: unsupported Unmarshal target (no reflection -- only *any, " +
+	return decodeReflect(reflect.ValueOf(v), val)
+}
+
+func jsonInt(src any) (int64, bool) {
+	if fv, ok := src.(float64); ok {
+		return int64(fv), true
+	}
+	if iv, ok := src.(int); ok {
+		return int64(iv), true
+	}
+	return 0, false
+}
+
+func decodeReflect(rv reflect.Value, src any) error {
+	if src == nil {
+		return nil
+	}
+	k := rv.Kind()
+	if k == reflect.Struct {
+		m, ok := src.(map[string]any)
+		if !ok {
+			return errors.New("json: cannot unmarshal into struct")
+		}
+		n := rv.NumField()
+		for i := 0; i < n; i++ {
+			name := rv.FieldName(i)
+			raw, has := m[name]
+			if !has {
+				continue
+			}
+			if err := decodeReflect(rv.Field(i), raw); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if k == reflect.String {
+		s, ok := src.(string)
+		if !ok {
+			return errors.New("json: cannot unmarshal into string field")
+		}
+		rv.SetString(s)
+		return nil
+	}
+	if k == reflect.Bool {
+		b, ok := src.(bool)
+		if !ok {
+			return errors.New("json: cannot unmarshal into bool field")
+		}
+		rv.SetBool(b)
+		return nil
+	}
+	if k == reflect.Int8 || k == reflect.Int16 || k == reflect.Int32 || k == reflect.Int64 {
+		n, ok := jsonInt(src)
+		if !ok {
+			return errors.New("json: cannot unmarshal into int field")
+		}
+		rv.SetInt(n)
+		return nil
+	}
+	if k == reflect.Float32 || k == reflect.Float64 {
+		f, ok := src.(float64)
+		if !ok {
+			return errors.New("json: cannot unmarshal into float field")
+		}
+		rv.SetFloat(f)
+		return nil
+	}
+	return errors.New("json: unsupported Unmarshal target (struct pointer, *any, " +
 		"*map[string]any, *[]any, *string, *float64, *bool)")
 }
 

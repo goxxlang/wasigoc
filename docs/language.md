@@ -34,7 +34,7 @@ func Name(param Type, ...) [Type | (name Type, ...)] { ... }
 func (recv [*]Name) Method(param Type, ...) [Type | (Type, ...)] { ... }
 func init() { ... }          // once per package, dependencies first, before main
 
-type Name T                  // or `type Name = T` -- C++ `using` (not a distinct type)
+type Name T                  // defined type (distinct C++ type if it has methods). `type Name = T` is `using`
 
 var x [Type] [= expr]        // grouped: var ( x = 1; y = 2 )
 const x [Type] [= expr]      // iota in a const group is folded to constexpr
@@ -46,7 +46,7 @@ select { case ch <- x: ... case v[, ok] := <-ch: ... default: ... }
 for { ... }
 for cond { ... }
 for init; cond; post { ... }
-for [k[, v]] := range expr { ... }   // slice, map, string (UTF-8 runes), chan
+for [k[, v]] := range expr { ... }   // slice, array, *array, map, string, chan, integer, iterator func
 go expr
 defer expr
 ch <- x  /  <-ch  /  v, ok := <-ch
@@ -62,23 +62,32 @@ x++ / x--
 ```
 
 Types: `bool`, `string`, `int`/`int8`/`int16`/`int32`/`int64`,
-`uint`/`uint8`/`uint16`/`uint32`/`uint64`, `byte`, `rune`, `float32`,
-`float64`, `error` (`wasigo::Error`), `any` / `interface{}`, a declared
+`uint`/`uint8`/`uint16`/`uint32`/`uint64`, `uintptr`, `byte`, `rune`, `float32`,
+`float64`, `complex64`, `complex128`, `error` (`wasigo::Error`), `any` / `interface{}`, a declared
 `struct` or `interface`, `*T`, `[]T` (`wasigo::Slice<T>`), `map[K]V`
 (`wasigo::Map<K,V>`), `chan T` (`wasigo::Chan<T>`), `[N]T`
-(`std::array`), `func(...)`. `int`/`uint` are always 64-bit.
+(`std::array`, length a const integer expression), `func(...)`. `int`/`uint` are always 64-bit.
+Composite literals, struct tags (`json:"name"` / `json:"-"`), hex floats
+(`0x1p10`, `0x1.fp+3`), trailing-dot floats (`1.`, `1.e2`), imaginary
+literals (`4i`).
 
 Builtins: `len`/`cap`/`append`/`copy`/`make`/`new`/`close`/`delete`/
-`panic`/`recover`/`min`/`max`/`clear`, method values, array slicing
+`panic`/`recover`/`min`/`max`/`clear`, `real`/`imag`/`complex`, method values, array slicing
 (copies into a `Slice`), numeric/`string` conversions.
 `fmt.Print*`/`Sprint*`/`Printf`/`Sprintf` (format string must be a
 **literal**; verbs `%d %s %f %v %t %c %%` only, no width/precision).
 `errors.New` / `errors.Is` (`errors.New("")` is still non-nil).
 
-Methods exist only on a real `struct` receiver. `type Duration int64` is
-a C++ `using` — no method set. Value receivers are `const` and copy
-`*this`. Pointer receivers mutate through `this`. Embedded interfaces
+Methods exist on structs and on defined types (`type Duration int64`
+emits a distinct C++ struct with a conversion to the underlying type, so
+the method set has somewhere to attach). Value receivers are `const` and
+copy `*this`. Pointer receivers mutate through `this`. Embedded interfaces
 flatten into the outer vtable. Embedding is public C++ inheritance.
+Anonymous `interface{ M() }` intern to the same generated adapter as a
+named interface with the same method set. Generic named types
+(`type Set[T any] struct`) are C++ class templates; `Set[int]` is
+`Set<int64_t>`. Range-over-func (`for v := range seq`) calls the iterator
+with a yield callback.
 
 A function that does `<-` / `select` becomes a C++20 coroutine (`Task` /
 `TaskT<T>`). `go` captures **by value**. Slice/map/chan nil and OOB
@@ -128,11 +137,12 @@ wasigoc examples/modnest/main.go -o modnest.cpp --out-dir gen/
 
 ## Limits worth knowing
 
-- No `complex128` (see `math/cmplx`: a `Complex` struct).
-- No range-over-func, no `iter`.
 - `recover()` does not unwind across calls.
 - Ordinary func literals capture `[&]`; `go` captures by value.
 - `fmt.Printf` format must be a string literal at the call site — no
   `log.Printf`-shaped wrappers.
-- `uintptr` is not a builtin (`unsafe.Pointer` is `uint64`).
+- `uintptr` is `uint64` (same width as `uint`).
 - `//go:embed` is not generated (`embed.FS` is an honest stub).
+- Range-over-func does not support `return` from inside the loop body
+  (break/continue are fine).
+- Generic interfaces (`type I[T any] interface`) are not generated.

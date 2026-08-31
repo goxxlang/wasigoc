@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/types"
 )
@@ -125,4 +126,75 @@ func main() {
 	c7.CheckStmt(body5[0])
 	err7 := c7.CheckStmt(body5[1])
 	fmt.Println(err7 != nil)
+
+	// Object-type identity: defined types intern by name, not underlying.
+	d1 := types.Named("Duration", types.IntType)
+	d2 := types.Named("Duration", types.IntType)
+	fmt.Println(types.Identical(d1, d2))
+	fmt.Println(types.Identical(d1, types.IntType))
+	fmt.Println(d1.String())
+
+	in := []*types.Type{}
+	in = append(in, types.SliceOf(types.IntType))
+	out := []*types.Type{}
+	out = append(out, types.IntType)
+	readSig := types.FuncOf(in, out)
+	readMs := []*types.Method{}
+	readMs = append(readMs, types.NewMethod("Read", readSig))
+	i1 := types.InterfaceOf(readMs)
+	readMs2 := []*types.Method{}
+	readMs2 = append(readMs2, types.NewMethod("Read", readSig))
+	i2 := types.InterfaceOf(readMs2)
+	fmt.Println(types.Identical(i1, i2))
+	fmt.Println(i1.String())
+	writeMs := []*types.Method{}
+	writeMs = append(writeMs, types.NewMethod("Write", readSig))
+	i3 := types.InterfaceOf(writeMs)
+	fmt.Println(types.Identical(i1, i3))
+
+	setInt := types.Instantiate("Set", types.IntType, types.SliceOf(types.IntType))
+	fmt.Println(types.Identical(setInt, types.SliceOf(types.IntType)))
+	fmt.Println(setInt.String())
+
+	otiSrc := "package main\n\ntype Duration int\n\ntype Set[T any] []T\n\ntype Reader interface {\n\tRead([]int) int\n}\n\nfunc (d Duration) String() string {\n\treturn \"x\"\n}\n\nfunc run() {\n\tvar d Duration\n\ts := d.String()\n\t_ = s\n\tvar xs Set[int]\n\t_ = xs\n}\n"
+	fOti, otiErr := parser.ParseFile(otiSrc)
+	fmt.Println(otiErr == nil)
+	fmt.Println(len(fOti.List))
+	fmt.Println(fOti.List[0].Kind == ast.TypeSpec)
+	fmt.Println(fOti.List[1].Name == "Set")
+	fmt.Println(len(fOti.List[1].Params))
+	fmt.Println(fOti.List[2].Type.Kind == ast.InterfaceType)
+	fmt.Println(fOti.List[3].X != nil)
+
+	cOti := types.NewChecker()
+	fmt.Println(cOti.CheckFile(fOti) == nil)
+	fmt.Println(cOti.Types["Duration"].String())
+	fmt.Println(types.Identical(cOti.Types["Duration"], types.IntType))
+	fmt.Println(types.Identical(cOti.Types["Reader"], i1))
+
+	bodyOti := fOti.List[4].Body.List
+	fmt.Println(len(bodyOti))
+	fmt.Println(cOti.CheckStmt(bodyOti[0]) == nil)
+	fmt.Println(cOti.CheckStmt(bodyOti[1]) == nil)
+	fmt.Println(cOti.CheckStmt(bodyOti[2]) == nil)
+	fmt.Println(cOti.CheckStmt(bodyOti[3]) == nil)
+	fmt.Println(cOti.CheckStmt(bodyOti[4]) == nil)
+	fmt.Println(cOti.Env["s"].String())
+	fmt.Println(cOti.Env["xs"].String())
+	fmt.Println(types.Identical(cOti.Env["xs"], types.SliceOf(types.IntType)))
+
+	yin := []*types.Type{}
+	yin = append(yin, types.IntType)
+	yout := []*types.Type{}
+	yout = append(yout, types.BoolType)
+	yield := types.FuncOf(yin, yout)
+	sin := []*types.Type{}
+	sin = append(sin, yield)
+	seq := types.FuncOf(sin, nil)
+	cSeq := types.NewChecker()
+	cSeq.Env["seq"] = seq
+	rangeFnSrc := "package main\n\nfunc run() {\n\tfor v := range seq {\n\t\t_ = v\n\t}\n}\n"
+	fSeq, _ := parser.ParseFile(rangeFnSrc)
+	fmt.Println(cSeq.CheckStmt(fSeq.List[0].Body.List[0]) == nil)
+	fmt.Println(cSeq.Env["v"].String())
 }

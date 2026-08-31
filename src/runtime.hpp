@@ -77,6 +77,73 @@
 
 namespace wasigo {
 
+// Go complex64 / complex128. std::complex is avoided: wasi-sdk's noeh
+// libc++ has pulled exception-shaped pieces from <complex> before.
+struct Complex64 {
+  float re = 0;
+  float im = 0;
+};
+struct Complex128 {
+  double re = 0;
+  double im = 0;
+};
+
+inline Complex64 operator+(Complex64 a, Complex64 b) { return {a.re + b.re, a.im + b.im}; }
+inline Complex64 operator-(Complex64 a, Complex64 b) { return {a.re - b.re, a.im - b.im}; }
+inline Complex64 operator-(Complex64 z) { return {-z.re, -z.im}; }
+inline Complex64 operator*(Complex64 a, Complex64 b) {
+  return {a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re};
+}
+inline Complex64 operator/(Complex64 a, Complex64 b) {
+  float d = b.re * b.re + b.im * b.im;
+  return {(a.re * b.re + a.im * b.im) / d, (a.im * b.re - a.re * b.im) / d};
+}
+inline bool operator==(Complex64 a, Complex64 b) { return a.re == b.re && a.im == b.im; }
+inline bool operator!=(Complex64 a, Complex64 b) { return !(a == b); }
+
+inline Complex128 operator+(Complex128 a, Complex128 b) { return {a.re + b.re, a.im + b.im}; }
+inline Complex128 operator-(Complex128 a, Complex128 b) { return {a.re - b.re, a.im - b.im}; }
+inline Complex128 operator-(Complex128 z) { return {-z.re, -z.im}; }
+inline Complex128 operator*(Complex128 a, Complex128 b) {
+  return {a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re};
+}
+inline Complex128 operator/(Complex128 a, Complex128 b) {
+  double d = b.re * b.re + b.im * b.im;
+  return {(a.re * b.re + a.im * b.im) / d, (a.im * b.re - a.re * b.im) / d};
+}
+inline bool operator==(Complex128 a, Complex128 b) { return a.re == b.re && a.im == b.im; }
+inline bool operator!=(Complex128 a, Complex128 b) { return !(a == b); }
+
+template <class T>
+inline Complex128 as_complex128(T x) {
+  if constexpr (std::is_same_v<T, Complex128>) return x;
+  else if constexpr (std::is_same_v<T, Complex64>)
+    return {static_cast<double>(x.re), static_cast<double>(x.im)};
+  else
+    return {static_cast<double>(x), 0};
+}
+template <class T>
+inline Complex64 as_complex64(T x) {
+  if constexpr (std::is_same_v<T, Complex64>) return x;
+  else if constexpr (std::is_same_v<T, Complex128>)
+    return {static_cast<float>(x.re), static_cast<float>(x.im)};
+  else
+    return {static_cast<float>(x), 0};
+}
+inline float creal(Complex64 z) { return z.re; }
+inline double creal(Complex128 z) { return z.re; }
+inline float cimag(Complex64 z) { return z.im; }
+inline double cimag(Complex128 z) { return z.im; }
+
+inline std::ostream& operator<<(std::ostream& o, Complex64 z) {
+  o << '(' << z.re << (z.im < 0 ? "" : "+") << z.im << "i)";
+  return o;
+}
+inline std::ostream& operator<<(std::ostream& o, Complex128 z) {
+  o << '(' << z.re << (z.im < 0 ? "" : "+") << z.im << "i)";
+  return o;
+}
+
 // ---- panic / recover --------------------------------------------------------
 // wasi-sdk's noeh libc++ has no C++ exceptions. Its setjmp.h refuses to
 // compile without the wasm exception-handling proposal. User-level panic
@@ -337,6 +404,8 @@ enum class RKind : int {
   Ptr,
   Struct,
   Slice,
+  Complex64,
+  Complex128,
 };
 
 struct FieldInfo;  // defined after Any -- see the forward-declaration note below
@@ -351,7 +420,7 @@ template <class T, class = void>
 struct has_reflect_describe : std::false_type {};
 template <class T>
 struct has_reflect_describe<
-    T, std::void_t<decltype(wasigo_reflect_describe(std::declval<const T*>(),
+    T, std::void_t<decltype(wasigo_reflect_describe(std::declval<T*>(),
                                                       std::declval<std::vector<FieldInfo>&>()))>>
     : std::true_type {};
 
@@ -373,7 +442,9 @@ constexpr int kind_of() {
   else if constexpr (std::is_same_v<T, uint32_t>) return static_cast<int>(RKind::Uint32);
   else if constexpr (std::is_same_v<T, uint64_t>) return static_cast<int>(RKind::Uint64);
   else if constexpr (std::is_same_v<T, float>) return static_cast<int>(RKind::Float32);
-  else if constexpr (std::is_same_v<T, double>) return static_cast<int>(RKind::Float64);
+      else if constexpr (std::is_same_v<T, double>) return static_cast<int>(RKind::Float64);
+  else if constexpr (std::is_same_v<T, Complex64>) return static_cast<int>(RKind::Complex64);
+  else if constexpr (std::is_same_v<T, Complex128>) return static_cast<int>(RKind::Complex128);
   else if constexpr (std::is_same_v<T, std::string>) return static_cast<int>(RKind::String);
   else if constexpr (std::is_pointer_v<T>) return static_cast<int>(RKind::Ptr);
   else if constexpr (has_reflect_describe<T>::value) return static_cast<int>(RKind::Struct);
@@ -387,6 +458,10 @@ constexpr int kind_of() {
   else return static_cast<int>(RKind::Invalid);
 }
 
+// Defined after Slice<T> — binds Len/Index when T is wasigo::Slice<U>.
+template <class T>
+void finish_any_kind(struct Any& a);
+
 // interface{} / any: boxed value + type_key, no RTTI. recover() stays Recovered.
 struct Any {
   std::shared_ptr<void> self;
@@ -398,6 +473,8 @@ struct Any {
   // wasigo_reflect_describe (see has_reflect_describe above) -- appends
   // this value's fields, by name, as their own Any-boxed values.
   void (*reflect_fields_fn)(const std::shared_ptr<void>&, std::vector<FieldInfo>&) = nullptr;
+  int64_t (*slice_len_fn)(const std::shared_ptr<void>&) = nullptr;
+  Any (*slice_index_fn)(const std::shared_ptr<void>&, int64_t) = nullptr;
   bool is_nil() const { return !self; }
   template<class T>
   static Any adapt(T v) {
@@ -410,7 +487,7 @@ struct Any {
     }
     if constexpr (has_reflect_describe<T>::value) {
       a.reflect_fields_fn = +[](const std::shared_ptr<void>& self, std::vector<FieldInfo>& out) {
-        wasigo_reflect_describe(static_cast<const T*>(self.get()), out);
+        wasigo_reflect_describe(static_cast<T*>(self.get()), out);
       };
     }
     if constexpr (std::is_same_v<T, bool>) {
@@ -421,9 +498,10 @@ struct Any {
       a.print_fn = +[](std::ostream& os, const void* p) {
         os << (*static_cast<const bool*>(p) ? "true" : "false");
       };
-    } else if constexpr (has_ostream_op<T>::value) {
+    } else     if constexpr (has_ostream_op<T>::value) {
       a.print_fn = +[](std::ostream& os, const void* p) { os << *static_cast<const T*>(p); };
     }
+    finish_any_kind<T>(a);
     return a;
   }
   template<class T>
@@ -443,12 +521,13 @@ struct Any {
     }
     if constexpr (has_reflect_describe<T>::value) {
       a.reflect_fields_fn = +[](const std::shared_ptr<void>& self, std::vector<FieldInfo>& out) {
-        wasigo_reflect_describe(static_cast<const T*>(self.get()), out);
+        wasigo_reflect_describe(static_cast<T*>(self.get()), out);
       };
     }
     if constexpr (has_ostream_op<T>::value) {
       a.print_fn = +[](std::ostream& os, const void* p) { os << *static_cast<const T*>(p); };
     }
+    finish_any_kind<T>(a);
     return a;
   }
   template<class T>
@@ -506,6 +585,14 @@ struct Any {
   int64_t NumField() const;
   Any Field(int64_t i) const;
   std::string FieldName(int64_t i) const;
+  bool CanSet() const { return self != nullptr; }
+  void SetInt(int64_t n);
+  void SetUint(uint64_t n);
+  void SetFloat(double n);
+  void SetBool(bool b);
+  void SetString(const std::string& s);
+  int64_t Len() const;
+  Any Index(int64_t i) const;
 };
 inline bool is_nil(const Any& a) { return a.is_nil(); }
 inline std::ostream& operator<<(std::ostream& os, const Any& a) {
@@ -549,6 +636,57 @@ inline std::string Any::FieldName(int64_t i) const {
   auto fields = reflect_fields(*this);
   if (i < 0 || static_cast<size_t>(i) >= fields.size()) panic("reflect: Field index out of range");
   return std::string(fields[static_cast<size_t>(i)].name);
+}
+
+inline void Any::SetInt(int64_t n) {
+  if (!self) panic("reflect: SetInt on zero Value");
+  switch (static_cast<RKind>(kind)) {
+    case RKind::Int8: *static_cast<int8_t*>(self.get()) = static_cast<int8_t>(n); return;
+    case RKind::Int16: *static_cast<int16_t*>(self.get()) = static_cast<int16_t>(n); return;
+    case RKind::Int32: *static_cast<int32_t*>(self.get()) = static_cast<int32_t>(n); return;
+    case RKind::Int64: *static_cast<int64_t*>(self.get()) = n; return;
+    default: panic("reflect: SetInt on a non-integer Value");
+  }
+}
+inline void Any::SetUint(uint64_t n) {
+  if (!self) panic("reflect: SetUint on zero Value");
+  switch (static_cast<RKind>(kind)) {
+    case RKind::Uint8: *static_cast<uint8_t*>(self.get()) = static_cast<uint8_t>(n); return;
+    case RKind::Uint16: *static_cast<uint16_t*>(self.get()) = static_cast<uint16_t>(n); return;
+    case RKind::Uint32: *static_cast<uint32_t*>(self.get()) = static_cast<uint32_t>(n); return;
+    case RKind::Uint64: *static_cast<uint64_t*>(self.get()) = n; return;
+    default: panic("reflect: SetUint on a non-unsigned Value");
+  }
+}
+inline void Any::SetFloat(double n) {
+  if (!self) panic("reflect: SetFloat on zero Value");
+  if (static_cast<RKind>(kind) == RKind::Float32) {
+    *static_cast<float*>(self.get()) = static_cast<float>(n);
+    return;
+  }
+  if (static_cast<RKind>(kind) == RKind::Float64) {
+    *static_cast<double*>(self.get()) = n;
+    return;
+  }
+  panic("reflect: SetFloat on a non-float Value");
+}
+inline void Any::SetBool(bool b) {
+  if (!self || static_cast<RKind>(kind) != RKind::Bool) panic("reflect: SetBool on a non-bool Value");
+  *static_cast<bool*>(self.get()) = b;
+}
+inline void Any::SetString(const std::string& s) {
+  if (!self || static_cast<RKind>(kind) != RKind::String) panic("reflect: SetString on a non-string Value");
+  *static_cast<std::string*>(self.get()) = s;
+}
+inline int64_t Any::Len() const {
+  if (slice_len_fn && self) return slice_len_fn(self);
+  panic("reflect: Len on a non-slice Value");
+  return 0;
+}
+inline Any Any::Index(int64_t i) const {
+  if (slice_index_fn && self) return slice_index_fn(self, i);
+  panic("reflect: Index on a non-slice Value");
+  return {};
 }
 
 // func values without <functional> (that header pulls a broken <cctype> on
@@ -837,6 +975,26 @@ int64_t len(const Slice<T>& s) {
 template<class T>
 int64_t cap(const Slice<T>& s) {
   return s.cap();
+}
+
+template <class T>
+struct is_wasigo_slice : std::false_type {};
+template <class T>
+struct is_wasigo_slice<Slice<T>> : std::true_type {};
+
+template <class T>
+inline void finish_any_kind(Any& a) {
+  if constexpr (is_wasigo_slice<T>::value) {
+    a.kind = static_cast<int>(RKind::Slice);
+    a.slice_len_fn = +[](const std::shared_ptr<void>& self) -> int64_t {
+      if (!self) return 0;
+      return static_cast<const T*>(self.get())->len();
+    };
+    a.slice_index_fn = +[](const std::shared_ptr<void>& self, int64_t i) -> Any {
+      auto* sl = static_cast<T*>(self.get());
+      return Any::adapt((*sl)[i]);
+    };
+  }
 }
 inline int64_t len(const std::string& s) { return static_cast<int64_t>(s.size()); }
 template<class T, std::size_t N>

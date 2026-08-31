@@ -79,7 +79,9 @@ bool EndsWithGo(const std::string& p) {
 
 File ParseGo(const std::string& path, const std::string& content) {
   try {
-    return Parse(Tokenize(content));
+    File f = Parse(Tokenize(content));
+    f.path = path;
+    return f;
   } catch (const LexError& e) {
     throw LoadError("in '" + path + "': " + e.what());
   } catch (const ParseError& e) {

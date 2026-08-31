@@ -13,7 +13,7 @@ Go++ source (.go)  ──>  wasigoc  ──>  C++ (.cpp)  ──>  wasm32-wasip1
 
 ```
 
-This is not `gc` and not a Go runtime port. `wasm32-wasip1` is one thread and has no growable stacks. The design is a **Rosetta**: keep the shape of the Go++ source, spell each construct as the C++ feature that is actually strong on WASM. See [docs/language.md](https://www.google.com/search?q=docs/language.md).
+This is not `gc` and not a Go runtime port. `wasm32-wasip1` is one thread and has no growable stacks. The design is a **Rosetta**: keep the shape of the Go++ source, spell each construct as the C++ feature that is actually strong on WASM. See [docs/language.md](docs/language.md).
 
 ---
 
@@ -41,7 +41,7 @@ wasigoc examples/hello/hello.go -o hello_gen.cpp
 
 ### 3. Compile to WASM
 
-Compile `hello_gen.cpp` with wasi-sdk's **triple wrapper** and the noeh include order — a bare `clang++ --target=wasm32-wasip1` will not work. See [docs/build.md](https://www.google.com/search?q=docs/build.md) for required flags.
+Compile `hello_gen.cpp` with wasi-sdk's **triple wrapper** and the noeh include order — a bare `clang++ --target=wasm32-wasip1` will not work. See [docs/build.md](docs/build.md) for required flags.
 
 ---
 
@@ -58,17 +58,18 @@ Compile `hello_gen.cpp` with wasi-sdk's **triple wrapper** and the noeh include 
 ## What's In
 
 * **Frontend:** Recursive-descent Go frontend with automatic semicolon insertion.
+* **Type identity:** interned `go/types` (pointer equality) and matching C++ codegen — methods on defined types (`type Duration int64`), generic named types (`type Set[T any] struct`), anonymous `interface{ M() }`, range-over-func.
 * **Modules & Scope:** Packages implemented as C++ namespaces; supports `go.mod` `replace` directives and `internal/` access rules.
 * **Standard Library:** Four builtins (`fmt`, `errors`, `os`, `reflect`) plus **146** compiled packages under `stdlib/` — matching public `go list std` minus `internal/`/`vendor/` and target-impossible APIs.
 * **Concurrency:** Cooperative `go` / `chan` / `select` powered by C++20 coroutines.
 * **Codecs & Hashes:** Real codecs and hashes (`flate`/`gzip`/`zlib`/`bzip2`/`lzw`, `PNG`/`JPEG`/`GIF`, `SHA-2`/`3`, `AES-128`, `P-256`, `Ed25519`, …) with documented bounds.
 * **Syscall Handling:** Honest stubs where WASI preview 1 has no syscalls (`os/exec`, `net.Dial`; `net.Pipe()` is real and is what [shim_sandbox](https://github.com/goxxlang/shim_sandbox) speaks).
 
-Language surface and Rosetta table: [docs/language.md](https://www.google.com/search?q=docs/language.md).
+Language surface and Rosetta table: [docs/language.md](docs/language.md).
 
-Stdlib status: [docs/stdlib.md](https://www.google.com/search?q=docs/stdlib.md).
+Stdlib status: [docs/stdlib.md](docs/stdlib.md).
 
-Per-package tracker and compiler-bug diary: [docs/design-log.md](https://www.google.com/search?q=docs/design-log.md).
+Per-package tracker and compiler-bug diary: [docs/design-log.md](docs/design-log.md).
 
 ---
 
@@ -86,7 +87,7 @@ ctest --test-dir build --output-on-failure
 * **MSVC Note:** Pass `-C Debug` to `ctest`.
 * **Optional Tools:** Install [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) for `_golden` wasm tests; install [wasmtime](https://wasmtime.dev/) to *run* those modules.
 
-Details, wasi-sdk include order, and the `wasigoc` CLI: [docs/build.md](https://www.google.com/search?q=docs/build.md).
+Details, wasi-sdk include order, and the `wasigoc` CLI: [docs/build.md](docs/build.md).
 
 ---
 
@@ -107,9 +108,9 @@ docs/        language, stdlib, build, design log
 
 | Document | Contents |
 | --- | --- |
-| [docs/language.md](https://www.google.com/search?q=docs/language.md) | Go++ syntax, Rosetta, modules |
-| [docs/stdlib.md](https://www.google.com/search?q=docs/stdlib.md) | Builtins, stubs, n/a, how to grow |
-| [docs/build.md](https://www.google.com/search?q=docs/build.md) | CMake, ctest, compile to wasm |
-| [docs/design-log.md](https://www.google.com/search?q=docs/design-log.md) | Full tracker + compiler-bug writeup |
-| [CONTRIBUTING.md](https://www.google.com/search?q=CONTRIBUTING.md) | Names, goldens, style |
+| [docs/language.md](docs/language.md) | Go++ syntax, Rosetta, modules |
+| [docs/stdlib.md](docs/stdlib.md) | Builtins, stubs, n/a, how to grow |
+| [docs/build.md](docs/build.md) | CMake, ctest, compile to wasm |
+| [docs/design-log.md](docs/design-log.md) | Full tracker + compiler-bug writeup |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Names, goldens, style |
 | [SECURITY.md](SECURITY.md) | What this is not; shim_sandbox ABAC |

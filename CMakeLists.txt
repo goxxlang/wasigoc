@@ -39,6 +39,10 @@ add_executable(wasigo_runtime_smoketest tests/runtime_smoketest.cc)
 target_include_directories(wasigo_runtime_smoketest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME runtime_smoketest COMMAND wasigo_runtime_smoketest)
 
+add_executable(wasigo_frontend_test tests/frontend_test.cc)
+target_link_libraries(wasigo_frontend_test PRIVATE wasigoc_lib)
+add_test(NAME frontend_test COMMAND wasigo_frontend_test)
+
 enable_testing()
 
 # ---- Locate wasi-sdk (optional) ---------------------------------------------
@@ -153,7 +157,9 @@ wasigo_add_golden(stdlibpkg "stdlibpkg/main.go" "HI\\n42\\nyes\\n2\\n1 2 3\\nc.g
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/math/math.go")
 wasigo_add_golden(asyncval "asyncval/main.go" "42\\n")
 wasigo_add_golden(iface "iface/main.go" "sum: 5\\nx: 2\\nnot string\\n")
-wasigo_add_golden(lang "lang/main.go" "3\\n7\\ntwo-or-three\\n9\\n0 71\\n1 111\\nGo\\n")
+wasigo_add_golden(lang "lang/main.go" "3\\n7\\ntwo-or-three\\n9\\n0 71\\n1 111\\nGo\\n4\\n8\\n3\\n")
+wasigo_add_golden(otigen "otigen/main.go" "0\\n2\\n7\\n3\\n")
+wasigo_add_golden(literals "literals/main.go" "255\\n8\\n10\\n8\\n0.5\\nA\\nA\\n7\\n937\\n10\\n7\\n4\\n8\\n15.5\\n1\\n100\\n")
 wasigo_add_golden(rangchan "rangchan/main.go" "6\\n")
 wasigo_add_golden(more "more/main.go" "PT\\n5\\n15\\n4\\nargs\\nhi\\n")
 wasigo_add_golden(iowrite "iowrite/main.go" "2\\n2\\n"
@@ -288,8 +294,15 @@ wasigo_add_golden(sha1pkg "sha1pkg/main.go"
 wasigo_add_golden(reflectpkg "reflectpkg/main.go"
   "true\\n3\\nX\\nY\\nName\\ntrue\\n3\\ntrue\\norigin\\nPoint\\ntrue\\ntrue\\n42\\ntrue\\nhello\\ntrue\\ntrue\\n")
 wasigo_add_golden(netpkg "netpkg/main.go"
-  "true\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\n5\\ntrue\\nhello\\n6\\ntrue\\n world\\ntrue\\ntrue\\ntrue\\n"
-  "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/net/net.go")
+  "true\\ntrue\\nfalse\\nfalse\\ntrue\\ntrue\\ntrue\\n5\\ntrue\\nhello\\n6\\ntrue\\n world\\ntrue\\ntrue\\ntrue\\ntrue\\nhi\\ntrue\\nping\\n127.0.0.1\\n80\\n[::1]:443\\ntrue\\npong\\n"
+  "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/net/net.go"
+  "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/strings/strings.go")
+wasigo_add_golden(httppkg "httppkg/main.go"
+  "true\\n200\\nok\\n200\\nPOST /echo hi\\n404\\nnot found\\n"
+  "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/net/http/http.go"
+  "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/net/net.go"
+  "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/strings/strings.go"
+  "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/strconv/strconv.go")
 wasigo_add_golden(tokenpkg "tokenpkg/main.go"
   "IDENT\\n+\\nfunc\\n<-\\ntrue\\ntrue\\ntrue\\ntrue\\nfalse\\ntrue\\ntrue\\nfalse\\ntrue\\n"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/token/token.go")
@@ -323,7 +336,7 @@ wasigo_add_golden(formatpkg "formatpkg/main.go" ""
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/scanner/scanner.go"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/token/token.go")
 wasigo_add_golden(typespkg "typespkg/main.go"
-  "true\\n*int\\ntrue\\n[]string\\nfalse\\nint\\nstring\\nbool\\nerror\\nint\\nerror\\n*int\\ntrue\\ntrue\\n5\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\nint\\nfloat64\\ntrue\\ntrue\\ntrue\\ntrue\\nmap[string]int\\ntrue\\nint\\ntrue\\n[]int\\ntrue\\ntrue\\n5\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\n"
+  "true\\n*int\\ntrue\\n[]string\\nfalse\\nint\\nstring\\nbool\\nerror\\nint\\nerror\\n*int\\ntrue\\ntrue\\n5\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\nint\\nfloat64\\ntrue\\ntrue\\ntrue\\ntrue\\nmap[string]int\\ntrue\\nint\\ntrue\\n[]int\\ntrue\\ntrue\\n5\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\nfalse\\nDuration\\ntrue\\ninterface{Read([]int)int}\\nfalse\\nfalse\\nSet[int]\\ntrue\\n5\\ntrue\\ntrue\\n1\\ntrue\\ntrue\\ntrue\\nDuration\\nfalse\\ntrue\\n5\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\nstring\\nSet[int]\\nfalse\\ntrue\\nint\\n"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/types/types.go"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/parser/parser.go"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/ast/ast.go"
@@ -708,7 +721,7 @@ wasigo_add_golden(gobuildpkg "gobuildpkg/main.go"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/scanner/scanner.go"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/go/token/token.go")
 wasigo_add_golden(cmplxpkg "cmplxpkg/main.go"
-  "true\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\n"
+  "true\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\ntrue\\n"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/math/cmplx/cmplx.go"
   "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/math/math.go")
 wasigo_add_golden(quickpkg "quickpkg/main.go"

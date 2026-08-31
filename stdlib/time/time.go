@@ -29,15 +29,6 @@ const (
 
 func Sleep(d Duration) {}
 
-// Not methods (`func (d Duration) Nanoseconds() ...`): wasigoc only
-// supports methods on a real `struct` (see cpp_generator.cc's receiver
-// validation) -- `type Duration int64` is a C++ `using` alias (README:
-// "not a distinct defined type"), which has nowhere to attach a C++
-// member function to. Real Go famously *does* hang a method set off a
-// non-struct defined type (Duration.String() is the standard-library
-// example); supporting that generally is future compiler work, not
-// something to special-case per type here. Free functions instead.
-
 func DurationNanoseconds(d Duration) int64 {
 	return int64(d)
 }

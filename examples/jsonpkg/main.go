@@ -15,6 +15,11 @@ type NamedPoint struct {
 	P     Point
 }
 
+type Tagged struct {
+	Name string `json:"name"`
+	Skip int    `json:"-"`
+}
+
 func main() {
 	src := `{"name":"Alice","age":30,"tags":["a","b"],"active":true,"score":4.5,"nested":{"x":1},"nil":null}`
 	var v any
@@ -70,6 +75,32 @@ func main() {
 	fmt.Println(nerr)
 	fmt.Println(string(nb))
 
+	var p Point
+	uerr := json.Unmarshal([]byte(`{"X":9,"Y":4}`), &p)
+	fmt.Println(uerr)
+	fmt.Println(p.X)
+	fmt.Println(p.Y)
+
+	var a Point
+	a.X = 1
+	a.Y = 2
+	var b Point
+	b.X = 3
+	b.Y = 4
+	var pts []Point
+	pts = append(pts, a)
+	pts = append(pts, b)
+	sl, serr := json.Marshal(pts)
+	fmt.Println(serr)
+	fmt.Println(string(sl))
+
+	var np2 NamedPoint
+	nerr2 := json.Unmarshal([]byte(`{"Label":"here","P":{"X":8,"Y":1}}`), &np2)
+	fmt.Println(nerr2)
+	fmt.Println(np2.Label)
+	inner := np2.P
+	fmt.Println(inner.X)
+
 	var bad any
 	badErr2 := json.Unmarshal([]byte("{bad json"), &bad)
 	fmt.Println(badErr2 != nil)
@@ -77,4 +108,11 @@ func main() {
 	fn := func() {}
 	_, badErr3 := json.Marshal(fn)
 	fmt.Println(badErr3 != nil)
+
+	tg := Tagged{Name: "bob", Skip: 9}
+	tb, _ := json.Marshal(tg)
+	fmt.Println(string(tb))
+	var backT Tagged
+	json.Unmarshal([]byte(`{"name":"ann"}`), &backT)
+	fmt.Println(backT.Name)
 }

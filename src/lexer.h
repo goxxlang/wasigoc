@@ -16,6 +16,7 @@ enum class TokKind {
   Ident,
   IntLit,
   FloatLit,
+  ImagLit,  // 2i, .5i — imaginary component of a complex128
   StringLit,
   RuneLit,
 

@@ -47,4 +47,14 @@ func main() {
 		fmt.Println(i, r)
 	}
 	fmt.Println(string([]byte(s)))
+	const N = 4
+	var buf [N]int
+	fmt.Println(len(buf))
+	var big [1 << 3]byte
+	fmt.Println(len(big))
+	sum := 0
+	for i := range 3 {
+		sum = sum + i
+	}
+	fmt.Println(sum)
 }

@@ -23,7 +23,7 @@ bool IsBuiltinTypeName(const std::string& n) {
   static const std::set<std::string> kNames = {
       "string", "int",   "int8",   "int16",  "int32",  "int64",
       "uint",   "uint8", "uint16", "uint32", "uint64", "float32",
-      "float64", "byte", "rune",   "bool",
+      "float64", "byte", "rune",   "bool",   "uintptr", "complex64", "complex128",
   };
   return kNames.count(n) != 0;
 }
@@ -227,13 +227,9 @@ File BuildOsBuiltinFile() {
 // (TypeOf/ValueOf) need EmitCall's help, the same way os.Getenv does --
 // see EmitCall's `pkg == "reflect"` branch.
 //
-// Scope, deliberately: read-only (no Set*, no addressable/settable
-// Values -- that needs pointer-based field mutation, a bigger feature);
-// Kind doesn't distinguish Go's same-width aliases (int vs int64, byte vs
-// uint8 -- see RKind's comment in runtime.hpp); no Slice/Map/Chan/Func
-// Kind classification yet (reports Invalid). Built for arbitrary-struct
-// encoding/json.Marshal, the concrete motivating use case; extend as
-// real needs come up rather than guessing ahead of them.
+// Scope: SetInt/SetString/SetBool/SetFloat/Len/Index are real. Field()
+// aliases struct memory via adapt_ptr so encoding/json can Unmarshal into
+// a struct pointer. Slice Kind is bound in finish_any_kind after Slice<T>.
 File BuildReflectBuiltinFile() {
   File f;
   f.package_name = "reflect";
@@ -288,6 +284,13 @@ File BuildReflectBuiltinFile() {
   method("Value", "Float", {}, MakeNamedType("float64"));
   method("Value", "Bool", {}, MakeNamedType("bool"));
   method("Value", "Type", {}, MakeNamedType("Type", "reflect"));
+  method("Value", "CanSet", {}, MakeNamedType("bool"));
+  method("Value", "SetInt", params1(param("n", MakeNamedType("int64"))), nullptr);
+  method("Value", "SetFloat", params1(param("n", MakeNamedType("float64"))), nullptr);
+  method("Value", "SetBool", params1(param("b", MakeNamedType("bool"))), nullptr);
+  method("Value", "SetString", params1(param("s", MakeNamedType("string"))), nullptr);
+  method("Value", "Len", {}, MakeNamedType("int"));
+  method("Value", "Index", params1(param("i", MakeNamedType("int"))), MakeNamedType("Value", "reflect"));
 
   FuncDecl type_of;
   type_of.name = "TypeOf";
@@ -341,18 +344,16 @@ class Generator {
       Error("package '" + file_.package_name + "' is a library and cannot define func main");
     }
 
-    // A method's receiver type must be a real `struct` this compiler can
-    // hang a C++ member function on -- `type X []T`/`type X map[K]V` is a
-    // `using` alias (README: "not a distinct defined type"), so a method
-    // declared on one has nowhere to attach and would otherwise be
-    // silently dropped from the whole program instead of erroring.
+    // A method's receiver is a struct, or a defined type (`type Duration
+    // int64`) that we emit as a distinct C++ struct so the method set has
+    // somewhere to attach. True aliases (`type T = U`) cannot have methods.
     for (auto& fn : file_.funcs) {
-      if (fn.has_receiver && !LookupStruct(fn.receiver_type)) {
-        Error("method '" + fn.name + "' has receiver type '" + fn.receiver_type +
-              "', which is not a struct declared in this package -- wasigoc only "
-              "supports methods on struct types (not on a defined slice/map/etc "
-              "alias, and not on an imported type)");
-      }
+      if (!fn.has_receiver) continue;
+      if (LookupStruct(fn.receiver_type)) continue;
+      const TypeAlias* a = LookupAlias(fn.receiver_type);
+      if (a && !a->is_alias_eq) continue;
+      Error("method '" + fn.name + "' has receiver type '" + fn.receiver_type +
+            "', which is not a struct or defined type declared in this package");
     }
 
     AnalyzeAsync();
@@ -400,7 +401,7 @@ class Generator {
     // See EmitMethodOutOfLine's own comment: a struct method's body needs
     // every OTHER struct type it touches complete, which only just
     // became true (every struct now has its field-only skeleton).
-    EmitStructMethodDefs();
+    EmitAllMethodDefs();
     // See FlushDeferredIfaceMethodDefs's own comment: an interface
     // method's forwarding body needs every struct type it touches
     // complete too.
@@ -418,9 +419,12 @@ class Generator {
   GenOptions opt_;
   std::ostringstream out_;
   int indent_ = 0;
+  mutable int err_line_ = 0;
+  mutable int err_col_ = 0;
 
   std::vector<std::unique_ptr<TypeNode>> synth_types_;
   std::vector<std::map<std::string, const TypeNode*>> scopes_;
+  std::vector<std::map<std::string, const Expr*>> const_inits_;
   std::map<std::string, const TypeNode*> globals_;
   std::set<std::string> result_struct_names_;
   const FuncDecl* current_func_ = nullptr;
@@ -458,9 +462,11 @@ class Generator {
     std::string brk;
     std::string cont;
     bool is_loop = false;
+    bool range_func = false;
   };
   std::vector<JumpFrame> jump_stack_;
   std::string pending_label_;
+  std::vector<std::string> current_type_params_;
   std::map<std::string, std::string> pkg_alias_;
 
   static std::string LoadRuntime() {
@@ -486,16 +492,83 @@ class Generator {
     return async_methods_.count(MethodKey(type, name)) != 0;
   }
 
-  [[noreturn]] void Error(const std::string& msg) const { throw GenError(msg); }
+  [[noreturn]] void Error(const std::string& msg) const {
+    std::string loc;
+    if (!file_.path.empty() && err_line_ > 0) {
+      loc = file_.path + ":" + std::to_string(err_line_) + ":" +
+            std::to_string(err_col_) + ": ";
+    } else if (err_line_ > 0) {
+      loc = std::to_string(err_line_) + ":" + std::to_string(err_col_) + ": ";
+    }
+    throw GenError(loc + msg);
+  }
+
+  void NoteLoc(const Expr& e) const {
+    if (e.line > 0) {
+      err_line_ = e.line;
+      err_col_ = e.col;
+    }
+  }
+  void NoteLoc(const Stmt& s) const {
+    if (s.line > 0) {
+      err_line_ = s.line;
+      err_col_ = s.col;
+    }
+  }
+  void NoteLoc(const Expr* e) const {
+    if (e) NoteLoc(*e);
+  }
 
   static bool IsBlank(const Expr& e) { return e.kind == ExprKind::Ident && e.strval == "_"; }
+
+  static bool IsComplexName(const std::string& n) {
+    return n == "complex64" || n == "complex128";
+  }
+  bool IsComplexType(const TypeNode* t) const {
+    t = ResolveUnderlying(t);
+    return t && t->kind == TypeKind::Named && t->pkg.empty() && IsComplexName(t->name);
+  }
+  static bool IsIntegerName(const std::string& n) {
+    return n == "int" || n == "int8" || n == "int16" || n == "int32" || n == "int64" ||
+           n == "uint" || n == "uint8" || n == "uint16" || n == "uint32" || n == "uint64" ||
+           n == "uintptr" || n == "byte" || n == "rune";
+  }
+  bool IsIntegerType(const TypeNode* t) const {
+    t = ResolveUnderlying(t);
+    return t && t->kind == TypeKind::Named && t->pkg.empty() && IsIntegerName(t->name);
+  }
+  bool IsFloat32Type(const TypeNode* t) const {
+    t = ResolveUnderlying(t);
+    return t && t->kind == TypeKind::Named && t->pkg.empty() && t->name == "float32";
+  }
+
+  static std::string ReflectFieldName(const FieldDecl& f) {
+    const std::string& tag = f.tag;
+    auto p = tag.find("json:\"");
+    if (p == std::string::npos) return f.name;
+    p += 6;
+    auto q = tag.find('"', p);
+    if (q == std::string::npos) return f.name;
+    std::string spec = tag.substr(p, q - p);
+    if (spec == "-") return "";
+    auto comma = spec.find(',');
+    if (comma != std::string::npos) spec = spec.substr(0, comma);
+    if (spec.empty()) return f.name;
+    return spec;
+  }
 
   std::string Indent() const { return std::string(static_cast<size_t>(indent_) * 2, ' '); }
 
   // ---- scope / type bookkeeping -------------------------------------------
 
-  void PushScope() { scopes_.emplace_back(); }
-  void PopScope() { scopes_.pop_back(); }
+  void PushScope() {
+    scopes_.emplace_back();
+    const_inits_.emplace_back();
+  }
+  void PopScope() {
+    scopes_.pop_back();
+    const_inits_.pop_back();
+  }
   void Declare(const std::string& name, const TypeNode* type) {
     if (!scopes_.empty()) scopes_.back()[name] = type;
   }
@@ -508,6 +581,21 @@ class Generator {
   // declarations of `err` and fails to compile ("redeclaration of ...").
   bool DeclaredInCurrentScope(const std::string& name) const {
     return !scopes_.empty() && scopes_.back().count(name) != 0;
+  }
+  const Expr* LookupConstInit(const std::string& name, int* iota_out = nullptr) const {
+    for (auto it = const_inits_.rbegin(); it != const_inits_.rend(); ++it) {
+      auto found = it->find(name);
+      if (found != it->end()) {
+        if (iota_out) *iota_out = 0;
+        return found->second;
+      }
+    }
+    const GlobalVarDecl* g = LookupGlobalDecl(name);
+    if (g && g->is_const && g->init) {
+      if (iota_out) *iota_out = g->iota_value;
+      return g->init.get();
+    }
+    return nullptr;
   }
   const TypeNode* Lookup(const std::string& name) const {
     for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
@@ -703,6 +791,14 @@ class Generator {
     }
     return nullptr;
   }
+  bool HasMethodsOn(const std::string& name, const std::string& pkg = "") const {
+    const File* f = pkg.empty() ? UnscopedFile() : FindPackage(pkg);
+    if (!f) return false;
+    for (auto& fn : f->funcs) {
+      if (fn.has_receiver && fn.receiver_type == name) return true;
+    }
+    return false;
+  }
   const FuncDecl* LookupMethod(const std::string& structName, const std::string& methodName,
                                const std::string& pkg = "") const {
     const File* f = pkg.empty() ? UnscopedFile() : FindPackage(pkg);
@@ -784,7 +880,8 @@ class Generator {
   static bool IsReflectKindName(const std::string& n) {
     static const std::set<std::string> kNames = {
         "Invalid", "Bool",    "Int8",    "Int16",   "Int32",  "Int64",  "Uint8", "Uint16",
-        "Uint32",  "Uint64",  "Float32", "Float64", "String", "Ptr",    "Struct",
+        "Uint32",  "Uint64",  "Float32", "Float64", "String", "Ptr",    "Struct", "Slice",
+        "Complex64", "Complex128",
     };
     return kNames.count(n) != 0;
   }
@@ -796,12 +893,25 @@ class Generator {
   }
 
   std::string SelfTypeName(const StructDecl& sd) const {
+    std::string n;
     if (opt_.library && !file_.package_name.empty() && file_.package_name != "main") {
       for (auto& f : sd.fields) {
-        if (f.name == sd.name) return file_.package_name + "::" + sd.name;
+        if (f.name == sd.name) {
+          n = file_.package_name + "::" + sd.name;
+          break;
+        }
       }
     }
-    return sd.name;
+    if (n.empty()) n = sd.name;
+    if (!sd.type_params.empty()) {
+      n += "<";
+      for (size_t i = 0; i < sd.type_params.size(); ++i) {
+        if (i) n += ", ";
+        n += sd.type_params[i];
+      }
+      n += ">";
+    }
+    return n;
   }
 
   const TypeNode* ResolveUnderlying(const TypeNode* t) const {
@@ -930,6 +1040,14 @@ class Generator {
         if (e.callee->kind == ExprKind::Ident && IsAsyncFree(e.callee->strval)) return true;
         if (e.callee->kind == ExprKind::Selector) {
           auto* sel = e.callee.get();
+          // pkg.Func(...) -- async_free_ is keyed by bare name (same as
+          // Ident calls). Without this, `st, body, _ := http.Get(...)` in
+          // main never marked main as a coroutine, and EmitCall emitted a
+          // bare TaskT with no co_await (no r0/r1 on the Task).
+          if (sel->x && sel->x->kind == ExprKind::Ident && IsImportedPackage(sel->x->strval) &&
+              IsAsyncFree(sel->strval)) {
+            return true;
+          }
           for (auto& k : async_methods_) {
             if (k.size() > sel->strval.size() + 1 &&
                 k.compare(k.size() - sel->strval.size(), sel->strval.size(), sel->strval) == 0 &&
@@ -1331,6 +1449,7 @@ class Generator {
     c->chan_send = t->chan_send;
     c->chan_recv = t->chan_recv;
     c->array_len = t->array_len;
+    c->array_len_expr = CloneArrayLen(t->array_len_expr.get());
     c->variadic = t->variadic;
     synth_types_.push_back(std::move(c));
     return synth_types_.back().get();
@@ -1399,8 +1518,10 @@ class Generator {
         {"int", "int64_t"},     {"int8", "int8_t"},     {"int16", "int16_t"},
         {"int32", "int32_t"},   {"int64", "int64_t"},   {"uint", "uint64_t"},
         {"uint8", "uint8_t"},   {"uint16", "uint16_t"}, {"uint32", "uint32_t"},
-        {"uint64", "uint64_t"}, {"byte", "uint8_t"},    {"rune", "int32_t"},
+        {"uint64", "uint64_t"}, {"uintptr", "uint64_t"}, {"byte", "uint8_t"},
+        {"rune", "int32_t"},
         {"float32", "float"},   {"float64", "double"},  {"bool", "bool"},
+        {"complex64", "wasigo::Complex64"}, {"complex128", "wasigo::Complex128"},
         {"string", "std::string"}, {"error", "wasigo::Error"}, {"any", "wasigo::Any"},
         {"__recovered", "wasigo::Recovered"},
     };
@@ -1410,6 +1531,9 @@ class Generator {
       for (auto& tp : current_func_->type_params) {
         if (tp == n) return n;
       }
+    }
+    for (auto& tp : current_type_params_) {
+      if (tp == n) return n;
     }
     if (LookupStruct(n)) return n;
     if (LookupInterface(n)) return n;
@@ -1430,16 +1554,24 @@ class Generator {
         (t->name == "Value" || t->name == "Type")) {
       return "wasigo::Any";
     }
-    if (t->pkg.empty() || t->pkg == file_.package_name) return NamedCppType(t->name);
-    // Cross-package: check existence against THAT package specifically
-    // (LookupStruct/LookupInterface/LookupAlias's `pkg`-empty case only
-    // ever searches `file_` now -- see their shared comment -- so the
-    // bare-name overload can't answer this; it would silently mean
-    // "does file_ have this name", which is the wrong question here).
-    if (LookupStruct(t->name, t->pkg) || LookupInterface(t->name, t->pkg) || LookupAlias(t->name, t->pkg)) {
-      return QualName(t->pkg, t->name);
+    std::string base;
+    if (t->pkg.empty() || t->pkg == file_.package_name) {
+      base = NamedCppType(t->name);
+    } else if (LookupStruct(t->name, t->pkg) || LookupInterface(t->name, t->pkg) ||
+               LookupAlias(t->name, t->pkg)) {
+      base = QualName(t->pkg, t->name);
+    } else {
+      Error("unknown type '" + t->pkg + "." + t->name + "'");
     }
-    Error("unknown type '" + t->pkg + "." + t->name + "'");
+    if (!t->type_args.empty()) {
+      base += "<";
+      for (size_t i = 0; i < t->type_args.size(); ++i) {
+        if (i) base += ", ";
+        base += CppType(t->type_args[i].get());
+      }
+      base += ">";
+    }
+    return base;
   }
 
   std::string CppType(const TypeNode* t) const {
@@ -1454,7 +1586,7 @@ class Generator {
       case TypeKind::Chan:
         return "wasigo::Chan<" + CppType(t->elem.get()) + ">";
       case TypeKind::Array:
-        return "std::array<" + CppType(t->elem.get()) + ", " + std::to_string(t->array_len) + ">";
+        return "std::array<" + CppType(t->elem.get()) + ", " + std::to_string(ResolvedArrayLen(t)) + ">";
       case TypeKind::Func: {
         std::string r = "void";
         if (t->func_results.size() == 1) r = CppType(t->func_results[0].get());
@@ -1476,15 +1608,21 @@ class Generator {
 
   const TypeNode* InferType(const Expr* e) {
     if (!e) return nullptr;
+    NoteLoc(*e);
     switch (e->kind) {
       case ExprKind::IntLit: return SynthNamed("int");
       case ExprKind::FloatLit: return SynthNamed("float64");
+      case ExprKind::ImagLit: return SynthNamed("complex128");
       case ExprKind::StringLit: return SynthNamed("string");
       case ExprKind::BoolLit: return SynthNamed("bool");
       case ExprKind::Nil: return nullptr;
       case ExprKind::Ident:
         if (e->strval == "iota") return SynthNamed("int");
-        return Lookup(e->strval);
+        if (const TypeNode* t = Lookup(e->strval)) return t;
+        if (const FuncDecl* f = LookupFreeFunc(e->strval)) {
+          return SynthFuncType(f->params, f->results);
+        }
+        return nullptr;
       case ExprKind::ParenExpr: return InferType(e->x.get());
       case ExprKind::Unary: {
         if (e->strval == "!") return SynthNamed("bool");
@@ -1499,9 +1637,19 @@ class Generator {
         }
         return InferType(e->x.get());
       }
-      case ExprKind::Binary:
+      case ExprKind::Binary: {
         if (IsComparisonOrLogicalOp(e->strval)) return SynthNamed("bool");
-        return InferType(e->x.get());
+        auto lt = InferType(e->x.get());
+        auto rt = InferType(e->y.get());
+        if (IsComplexType(lt) || IsComplexType(rt)) {
+          if (IsComplexType(lt) && lt->name == "complex64" && IsComplexType(rt) &&
+              rt->name == "complex64") {
+            return SynthNamed("complex64");
+          }
+          return SynthNamed("complex128");
+        }
+        return lt;
+      }
       case ExprKind::Selector: {
         if (e->x->kind == ExprKind::Ident && PkgOf(e->x->strval) == "fmt") {
           Error("'fmt' is a package, not a value");
@@ -1744,6 +1892,19 @@ class Generator {
     }
     if (e.callee->kind == ExprKind::Ident) {
       const std::string& name = e.callee->strval;
+      if (name == "real" || name == "imag") {
+        if (e.args.empty()) return SynthNamed("float64");
+        auto t = InferType(e.args[0].get());
+        if (IsComplexType(t) && t->name == "complex64") return SynthNamed("float32");
+        return SynthNamed("float64");
+      }
+      if (name == "complex") {
+        if (e.args.size() >= 2 && IsFloat32Type(InferType(e.args[0].get())) &&
+            IsFloat32Type(InferType(e.args[1].get()))) {
+          return SynthNamed("complex64");
+        }
+        return SynthNamed("complex128");
+      }
       if (name == "len" || name == "cap" || name == "copy") return SynthNamed("int");
       if (name == "append") return e.args.empty() ? nullptr : InferType(e.args[0].get());
       if (name == "panic") return nullptr;
@@ -1860,6 +2021,14 @@ class Generator {
         return EmitAdapt(expected, e);
       }
     }
+    if (expected && IsComplexType(expected)) {
+      auto actual = InferType(&e);
+      if (!IsComplexType(actual) || actual->name != expected->name) {
+        std::string conv =
+            expected->name == "complex64" ? "wasigo::as_complex64" : "wasigo::as_complex128";
+        return conv + std::string("(") + EmitExpr(e) + ")";
+      }
+    }
     return EmitExpr(e);
   }
 
@@ -1906,6 +2075,7 @@ class Generator {
   // ---- expressions ----------------------------------------------------------
 
   std::string EmitExpr(const Expr& e) {
+    NoteLoc(e);
     switch (e.kind) {
       // The "LL" suffix matters beyond style: an `auto`-deduced declaration
       // (e.g. `total := 0` -> `auto total = 0;`) would otherwise deduce a
@@ -1932,6 +2102,8 @@ class Generator {
         if (e.intval < 0) return std::to_string(static_cast<uint64_t>(e.intval)) + "ULL";
         return std::to_string(e.intval) + "LL";
       case ExprKind::FloatLit: return FormatDouble(e.floatval);
+      case ExprKind::ImagLit:
+        return "wasigo::Complex128{0.0, " + FormatDouble(e.floatval) + "}";
       case ExprKind::StringLit: return EscapeCppStringLiteral(e.strval);
       case ExprKind::BoolLit: return e.boolval ? "true" : "false";
       case ExprKind::Nil: return "nullptr";
@@ -1990,6 +2162,21 @@ class Generator {
           // in C++ at all, only `std::string + const char*` does. Only the
           // left operand needs the wrap for that overload to kick in.
           return "(std::string(" + EmitExpr(*e.x) + ") + " + EmitExpr(*e.y) + ")";
+        }
+        {
+          auto lt = InferType(e.x.get());
+          auto rt = InferType(e.y.get());
+          if (IsComplexType(lt) || IsComplexType(rt)) {
+            if (e.strval != "+" && e.strval != "-" && e.strval != "*" && e.strval != "/" &&
+                e.strval != "==" && e.strval != "!=") {
+              Error("complex values only support +, -, *, /, ==, and !=");
+            }
+            bool c64 = IsComplexType(lt) && lt->name == "complex64" && IsComplexType(rt) &&
+                       rt->name == "complex64";
+            const char* conv = c64 ? "wasigo::as_complex64" : "wasigo::as_complex128";
+            return "(" + std::string(conv) + "(" + EmitExpr(*e.x) + ") " + e.strval + " " +
+                   conv + "(" + EmitExpr(*e.y) + "))";
+          }
         }
         std::string result = e.strval == "&^"
                                   ? "(" + EmitExpr(*e.x) + " & ~" + EmitExpr(*e.y) + ")"
@@ -2628,6 +2815,11 @@ class Generator {
       if (IsRuneSlice(src_type)) return src_str;
       Error("[]rune(x) is only supported when x is a string or []rune");
     }
+    if (target->kind == TypeKind::Named && IsComplexName(target->name)) {
+      std::string conv =
+          target->name == "complex64" ? "wasigo::as_complex64" : "wasigo::as_complex128";
+      return conv + "(" + src_str + ")";
+    }
     if (target->kind == TypeKind::Named) {
       return "static_cast<" + CppType(target) + ">(" + src_str + ")";
     }
@@ -2858,7 +3050,9 @@ class Generator {
         const FuncDecl* f = LookupFreeFunc(sel->strval, pkg);
         if (f) {
           std::string args = EmitArgsFor(f->params, e.args, pkg);
-          return QualName(pkg, sel->strval) + "(" + args + ")";
+          std::string call = QualName(pkg, sel->strval) + "(" + args + ")";
+          if (IsAsyncFree(sel->strval) && current_async_) return "co_await " + call;
+          return call;
         }
         // See the matching InferCallType branch: `pkg.Type(x)` is a
         // cross-package named-type conversion (e.g. `time.Duration(n)`),
@@ -2961,6 +3155,25 @@ class Generator {
         if (e.args.size() != 1) Error("any() expects exactly one argument");
         return EmitAdapt(SynthNamed("any"), *e.args[0]);
       }
+      if (name == "complex") {
+        if (e.args.size() != 2) Error("complex() expects two arguments");
+        auto t0 = InferType(e.args[0].get());
+        auto t1 = InferType(e.args[1].get());
+        if (IsFloat32Type(t0) && IsFloat32Type(t1)) {
+          return "wasigo::Complex64{" + EmitExpr(*e.args[0]) + ", " + EmitExpr(*e.args[1]) + "}";
+        }
+        return "wasigo::Complex128{" + EmitExpr(*e.args[0]) + ", " + EmitExpr(*e.args[1]) + "}";
+      }
+      if (name == "real") {
+        if (e.args.size() != 1) Error("real() expects one argument");
+        if (!IsComplexType(InferType(e.args[0].get()))) Error("real() requires a complex argument");
+        return "wasigo::creal(" + EmitExpr(*e.args[0]) + ")";
+      }
+      if (name == "imag") {
+        if (e.args.size() != 1) Error("imag() expects one argument");
+        if (!IsComplexType(InferType(e.args[0].get()))) Error("imag() requires a complex argument");
+        return "wasigo::cimag(" + EmitExpr(*e.args[0]) + ")";
+      }
       if (name == "make") return EmitMake(e);
       if (name == "new") {
         if (e.args.size() != 1) Error("new() expects one argument");
@@ -3029,6 +3242,7 @@ class Generator {
   }
 
   void EmitStmt(const Stmt& s) {
+    NoteLoc(s);
     switch (s.kind) {
       case StmtKind::Var: EmitVarStmt(s); return;
       case StmtKind::ShortVarDecl: EmitShortVarDecl(s); return;
@@ -3099,6 +3313,14 @@ class Generator {
         const FuncDecl* f = LookupFreeFunc(e.callee->strval);
         std::string args = f ? EmitArgsFor(f->params, e.args) : "";
         out_ << Indent() << "wasigo::go(" << e.callee->strval << "(" << args << "));\n";
+        return;
+      }
+      if (e.callee->kind == ExprKind::Selector && e.callee->x && e.callee->x->kind == ExprKind::Ident &&
+          IsImportedPackage(e.callee->x->strval) && IsAsyncFree(e.callee->strval)) {
+        const std::string pkg = PkgOf(e.callee->x->strval);
+        const FuncDecl* f = LookupFreeFunc(e.callee->strval, pkg);
+        std::string args = f ? EmitArgsFor(f->params, e.args, pkg) : "";
+        out_ << Indent() << "wasigo::go(" << QualName(pkg, e.callee->strval) << "(" << args << "));\n";
         return;
       }
       if (e.callee->kind == ExprKind::FuncLit) {
@@ -3485,6 +3707,9 @@ class Generator {
       if (has_init) {
         const TypeNode* declared = s.var_type.get();
         std::string rhs_str = declared ? EmitExprAs(*s.rhs[i], declared) : EmitExpr(*s.rhs[i]);
+        if (s.is_const && i < s.rhs.size() && !const_inits_.empty()) {
+          const_inits_.back()[name] = s.rhs[i].get();
+        }
         if (declared) {
           out_ << Indent() << CppType(declared) << " " << CppIdent(name) << " = " << rhs_str
                << ";\n";
@@ -3816,6 +4041,11 @@ class Generator {
   }
 
   void EmitReturn(const Stmt& s) {
+    for (auto it = jump_stack_.rbegin(); it != jump_stack_.rend(); ++it) {
+      if (it->range_func) {
+        Error("return inside range-over-func is not supported");
+      }
+    }
     const char* kw = current_async_ ? "co_return" : "return";
     if (s.rhs.empty()) {
       if (IsMainFunc() && !current_async_) {
@@ -3963,11 +4193,19 @@ class Generator {
     if (!s.names.empty()) {
       for (auto it = jump_stack_.rbegin(); it != jump_stack_.rend(); ++it) {
         if (it->name == s.names[0] && !it->brk.empty()) {
+          if (it->range_func) {
+            out_ << Indent() << "return false;\n";
+            return;
+          }
           out_ << Indent() << "goto " << it->brk << ";\n";
           return;
         }
       }
       Error("break label '" + s.names[0] + "' is not a surrounding loop or switch");
+    }
+    if (!jump_stack_.empty() && jump_stack_.back().range_func) {
+      out_ << Indent() << "return false;\n";
+      return;
     }
     if (!jump_stack_.empty() && !jump_stack_.back().brk.empty()) {
       out_ << Indent() << "goto " << jump_stack_.back().brk << ";\n";
@@ -3979,15 +4217,25 @@ class Generator {
   void EmitContinue(const Stmt& s) {
     if (!s.names.empty()) {
       for (auto it = jump_stack_.rbegin(); it != jump_stack_.rend(); ++it) {
-        if (it->is_loop && it->name == s.names[0] && !it->cont.empty()) {
-          out_ << Indent() << "goto " << it->cont << ";\n";
-          return;
+        if (it->is_loop && it->name == s.names[0]) {
+          if (it->range_func) {
+            out_ << Indent() << "return true;\n";
+            return;
+          }
+          if (!it->cont.empty()) {
+            out_ << Indent() << "goto " << it->cont << ";\n";
+            return;
+          }
         }
       }
       Error("continue label '" + s.names[0] + "' is not a surrounding loop");
     }
     for (auto it = jump_stack_.rbegin(); it != jump_stack_.rend(); ++it) {
       if (!it->is_loop) continue;
+      if (it->range_func) {
+        out_ << Indent() << "return true;\n";
+        return;
+      }
       if (!it->cont.empty()) {
         out_ << Indent() << "goto " << it->cont << ";\n";
         return;
@@ -4052,15 +4300,72 @@ class Generator {
     EndLoop(j);
   }
 
+  void EmitRangeOverFunc(const Stmt& s, const TypeNode* ft, const std::string& range_src) {
+    if (!ft || ft->func_params.size() != 1 || !ft->func_params[0].type ||
+        ft->func_params[0].type->kind != TypeKind::Func) {
+      Error("'range' over a func requires func(yield func(...) bool)");
+    }
+    const TypeNode* yield = ft->func_params[0].type.get();
+    if (yield->func_results.size() != 1 || !yield->func_results[0] ||
+        yield->func_results[0]->kind != TypeKind::Named || yield->func_results[0]->name != "bool") {
+      Error("'range' over a func requires the yield callback to return bool");
+    }
+    const auto& yparams = yield->func_params;
+    if (yparams.size() != 1 && yparams.size() != 2) {
+      Error("range-over-func yield must take 1 or 2 arguments");
+    }
+    if (yparams.size() == 1 && s.range_has_value) {
+      Error("range over seq yields one value");
+    }
+    jump_stack_.back().range_func = true;
+    out_ << Indent() << range_src << "(" << CppType(yield) << "{[&](";
+    for (size_t i = 0; i < yparams.size(); ++i) {
+      if (i) out_ << ", ";
+      out_ << CppType(yparams[i].type.get()) << " __y" << i;
+    }
+    out_ << ") -> bool {\n";
+    indent_++;
+    if (yparams.size() == 1) {
+      if (s.range_has_key && s.names[0] != "_") {
+        out_ << Indent() << CppType(yparams[0].type.get()) << " " << CppIdent(s.names[0])
+             << " = __y0;\n";
+        Declare(s.names[0], yparams[0].type.get());
+      }
+    } else {
+      if (s.range_has_key && s.names[0] != "_") {
+        out_ << Indent() << CppType(yparams[0].type.get()) << " " << CppIdent(s.names[0])
+             << " = __y0;\n";
+        Declare(s.names[0], yparams[0].type.get());
+      }
+      if (s.range_has_value && s.names.size() > 1 && s.names[1] != "_") {
+        out_ << Indent() << CppType(yparams[1].type.get()) << " " << CppIdent(s.names[1])
+             << " = __y1;\n";
+        Declare(s.names[1], yparams[1].type.get());
+      }
+    }
+    EmitStmtList(s.body);
+    out_ << Indent() << "return true;\n";
+    indent_--;
+    out_ << Indent() << "}});\n";
+  }
+
   void EmitForRange(const Stmt& s) {
-    auto baseType = InferType(s.range_expr.get());
+    auto baseType = ResolveUnderlying(InferType(s.range_expr.get()));
     if (!baseType) Error("cannot resolve the type of a 'range' expression");
+    std::string range_src = EmitExpr(*s.range_expr);
+    if (baseType->kind == TypeKind::Pointer) {
+      auto elem = ResolveUnderlying(baseType->elem.get());
+      if (elem && elem->kind == TypeKind::Array) {
+        baseType = elem;
+        range_src = "(*(" + range_src + "))";
+      }
+    }
     auto j = BeginLoop();
     PushScope();
     if (baseType->kind == TypeKind::Slice) {
       std::string rv = "__r" + std::to_string(temp_id_++);
       std::string iv = "__i" + std::to_string(temp_id_++);
-      out_ << Indent() << "auto&& " << rv << " = " << EmitExpr(*s.range_expr) << ";\n";
+      out_ << Indent() << "auto&& " << rv << " = " << range_src << ";\n";
       out_ << Indent() << "for (size_t " << iv << " = 0; " << iv << " < " << rv << ".size(); ++" << iv << ") {\n";
       indent_++;
       if (s.range_has_key) {
@@ -4082,7 +4387,7 @@ class Generator {
     } else if (baseType->kind == TypeKind::Array) {
       std::string rv = "__r" + std::to_string(temp_id_++);
       std::string iv = "__i" + std::to_string(temp_id_++);
-      out_ << Indent() << "auto&& " << rv << " = " << EmitExpr(*s.range_expr) << ";\n";
+      out_ << Indent() << "auto&& " << rv << " = " << range_src << ";\n";
       out_ << Indent() << "for (size_t " << iv << " = 0; " << iv << " < " << rv << ".size(); ++" << iv
            << ") {\n";
       indent_++;
@@ -4095,6 +4400,23 @@ class Generator {
         std::string val_name = s.names[1];
         out_ << Indent() << "auto& " << CppIdent(val_name) << " = " << rv << "[" << iv << "];\n";
         Declare(val_name, baseType->elem.get());
+      }
+      EmitStmtList(s.body);
+      EmitContLabel();
+      indent_--;
+      out_ << Indent() << "}\n";
+    } else if (IsIntegerType(baseType)) {
+      if (s.range_has_value) Error("range over an integer yields a single index");
+      std::string n = "__n" + std::to_string(temp_id_++);
+      std::string iv = "__i" + std::to_string(temp_id_++);
+      out_ << Indent() << "int64_t " << n << " = " << range_src << ";\n";
+      out_ << Indent() << "for (int64_t " << iv << " = 0; " << iv << " < " << n << "; ++" << iv
+           << ") {\n";
+      indent_++;
+      if (s.range_has_key && s.names[0] != "_") {
+        out_ << Indent() << CppType(SynthNamed("int")) << " " << CppIdent(s.names[0]) << " = " << iv
+             << ";\n";
+        Declare(s.names[0], SynthNamed("int"));
       }
       EmitStmtList(s.body);
       EmitContLabel();
@@ -4166,8 +4488,10 @@ class Generator {
       EmitContLabel();
       indent_--;
       out_ << Indent() << "}\n";
+    } else if (baseType->kind == TypeKind::Func) {
+      EmitRangeOverFunc(s, baseType, range_src);
     } else {
-      Error("'range' requires a slice, map, string, or channel");
+      Error("'range' requires a slice, array, map, string, channel, integer, or iterator func");
     }
     PopScope();
     EndLoop(j);
@@ -4176,7 +4500,10 @@ class Generator {
   // ---- top-level emission -----------------------------------------------------
 
   void EmitStructForwardDecls() {
-    for (auto& sd : file_.structs) out_ << "struct " << sd.name << ";\n";
+    for (auto& sd : file_.structs) {
+      if (!sd.type_params.empty()) out_ << TemplatePrefixFrom(sd.type_params);
+      out_ << "struct " << sd.name << ";\n";
+    }
     for (auto& name : result_struct_names_) out_ << "struct " << name << ";\n";
     out_ << "\n";
   }
@@ -4353,7 +4680,7 @@ class Generator {
     std::string ret_type = (!async && fn.results.size() == 1)
                                 ? ElaboratedParamOrReturnType(fn.results[0].get())
                                 : FuncCppType(fn, async);
-    out_ << ret_type << " " << recv_type_name << "::" << fn.name << "(";
+    out_ << TemplatePrefix(fn) << ret_type << " " << recv_type_name << "::" << fn.name << "(";
     for (size_t i = 0; i < fn.params.size(); ++i) {
       if (i) out_ << ", ";
       std::string pt = fn.params[i].variadic ? ParamCppType(fn.params[i])
@@ -4393,8 +4720,20 @@ class Generator {
     }
   }
 
+  void EmitAllMethodDefs() {
+    EmitStructMethodDefs();
+    for (auto& fn : file_.funcs) {
+      if (!fn.has_receiver) continue;
+      if (LookupStruct(fn.receiver_type)) continue;
+      EmitMethodOutOfLine(fn);
+    }
+  }
+
   void EmitStructDefs() {
+    auto saved_tp = current_type_params_;
     for (auto& sd : file_.structs) {
+      current_type_params_ = sd.type_params;
+      if (!sd.type_params.empty()) out_ << TemplatePrefixFrom(sd.type_params);
       out_ << "struct " << sd.name;
       bool first_base = true;
       for (auto& f : sd.fields) {
@@ -4447,6 +4786,7 @@ class Generator {
       out_ << "};\n\n";
       EmitReflectDescribe(sd);
     }
+    current_type_params_ = saved_tp;
   }
 
   // Per-struct reflection metadata (see runtime.hpp's has_reflect_describe/
@@ -4458,6 +4798,7 @@ class Generator {
   // Embedded/anonymous fields are skipped (their promoted-field shape
   // isn't reflected through here).
   void EmitReflectDescribe(const StructDecl& sd) {
+    if (!sd.type_params.empty()) return;
     std::string self_type = SelfTypeName(sd);
     // "outFields", not "__out": a leading-double-underscore identifier is
     // reserved to the implementation anyway, and "__out" specifically
@@ -4467,16 +4808,22 @@ class Generator {
     // MSVC then reports nonsensical "syntax error '.'" at every later use
     // of the (macro-expanded-away) parameter, not at the macro site
     // itself, which made this one take a moment to place.
-    out_ << "inline void wasigo_reflect_describe(const " << self_type
+    out_ << "inline void wasigo_reflect_describe(" << self_type
          << "* __v, std::vector<wasigo::FieldInfo>& outFields) {\n";
     for (auto& f : sd.fields) {
       if (f.embedded || f.name.empty() || !std::isupper(static_cast<unsigned char>(f.name[0]))) continue;
+      std::string json_name = ReflectFieldName(f);
+      if (json_name.empty()) continue;
       std::string fn = FieldCppName(sd.name, f.name);
-      // A pointer-typed field needs adapt_ptr, not adapt<T> -- same rule
-      // EmitAdapt uses for an ordinary `any`-boxing call site.
-      std::string adaptFn = (f.type && f.type->kind == TypeKind::Pointer) ? "adapt_ptr" : "adapt";
-      out_ << "  outFields.push_back({\"" << f.name << "\", wasigo::Any::" << adaptFn << "(__v->" << fn
-           << ")});\n";
+      // Pointer fields stay adapt_ptr(field). Value fields use adapt_ptr(&field)
+      // so reflect.Value.Set* writes through to the struct (JSON Unmarshal).
+      if (f.type && f.type->kind == TypeKind::Pointer) {
+        out_ << "  outFields.push_back({" << EscapeCppStringLiteral(json_name)
+             << ", wasigo::Any::adapt_ptr(__v->" << fn << ")});\n";
+      } else {
+        out_ << "  outFields.push_back({" << EscapeCppStringLiteral(json_name)
+             << ", wasigo::Any::adapt_ptr(&__v->" << fn << ")});\n";
+      }
     }
     out_ << "}\n";
     out_ << "inline const char* wasigo_reflect_typename(const " << self_type << "*) { return \""
@@ -4496,22 +4843,30 @@ class Generator {
     }
   }
 
-  int64_t EvalConstI64(const Expr& e, int iota) {
+  int64_t EvalConstI64(const Expr& e, int iota, int depth = 0) const {
+    if (depth > 32) Error("const cycle");
+    NoteLoc(e);
     switch (e.kind) {
       case ExprKind::IntLit:
         return e.intval;
-      case ExprKind::Ident:
+      case ExprKind::Ident: {
         if (e.strval == "iota") return iota;
+        int next_iota = 0;
+        if (const Expr* init = LookupConstInit(e.strval, &next_iota)) {
+          return EvalConstI64(*init, next_iota, depth + 1);
+        }
         Error("const '" + e.strval + "' is not a compile-time integer (iota/literal)");
+      }
       case ExprKind::ParenExpr:
-        return EvalConstI64(*e.x, iota);
+        return EvalConstI64(*e.x, iota, depth + 1);
       case ExprKind::Unary:
-        if (e.strval == "-") return -EvalConstI64(*e.x, iota);
-        if (e.strval == "+") return EvalConstI64(*e.x, iota);
+        if (e.strval == "-") return -EvalConstI64(*e.x, iota, depth + 1);
+        if (e.strval == "+") return EvalConstI64(*e.x, iota, depth + 1);
+        if (e.strval == "^") return ~EvalConstI64(*e.x, iota, depth + 1);
         Error("unsupported unary operator in a const");
       case ExprKind::Binary: {
-        int64_t l = EvalConstI64(*e.x, iota);
-        int64_t r = EvalConstI64(*e.y, iota);
+        int64_t l = EvalConstI64(*e.x, iota, depth + 1);
+        int64_t r = EvalConstI64(*e.y, iota, depth + 1);
         if (e.strval == "+") return l + r;
         if (e.strval == "-") return l - r;
         if (e.strval == "*") return l * r;
@@ -4523,11 +4878,80 @@ class Generator {
           if (r == 0) Error("division by zero in a const");
           return l % r;
         }
+        if (e.strval == "<<") {
+          if (r < 0 || r >= 64) Error("invalid shift count in a const");
+          return l << r;
+        }
+        if (e.strval == ">>") {
+          if (r < 0 || r >= 64) Error("invalid shift count in a const");
+          return l >> r;
+        }
+        if (e.strval == "&") return l & r;
+        if (e.strval == "|") return l | r;
+        if (e.strval == "^") return l ^ r;
+        if (e.strval == "&^") return l & ~r;
         Error("unsupported operator '" + e.strval + "' in a const");
       }
       default:
         Error("const initializer is not a compile-time integer");
     }
+  }
+
+  int64_t EvalArrayLen(const ArrayLenExpr& e, int depth = 0) const {
+    if (depth > 32) Error("const cycle in array length");
+    switch (e.kind) {
+      case ArrayLenExpr::Kind::Lit:
+        if (e.lit < 0) Error("array length must be non-negative");
+        return e.lit;
+      case ArrayLenExpr::Kind::Ident: {
+        if (e.ident == "iota") Error("iota is not a valid array length here");
+        int next_iota = 0;
+        const Expr* init = LookupConstInit(e.ident, &next_iota);
+        if (!init) Error("array length '" + e.ident + "' is not a const integer");
+        int64_t n = EvalConstI64(*init, next_iota, depth + 1);
+        if (n < 0) Error("array length must be non-negative");
+        return n;
+      }
+      case ArrayLenExpr::Kind::Unary: {
+        if (!e.x) Error("array length must be a constant integer expression");
+        int64_t v = EvalArrayLen(*e.x, depth + 1);
+        if (e.op == "+") return v;
+        if (e.op == "-") Error("array length must be non-negative");
+        Error("unsupported unary operator in array length");
+      }
+      case ArrayLenExpr::Kind::Binary: {
+        if (!e.x || !e.y) Error("array length must be a constant integer expression");
+        int64_t l = EvalArrayLen(*e.x, depth + 1);
+        int64_t r = EvalArrayLen(*e.y, depth + 1);
+        if (e.op == "+") return l + r;
+        if (e.op == "-") return l - r;
+        if (e.op == "*") return l * r;
+        if (e.op == "/") {
+          if (r == 0) Error("division by zero in a const");
+          return l / r;
+        }
+        if (e.op == "<<") {
+          if (r < 0 || r >= 64) Error("invalid shift count in a const");
+          return l << r;
+        }
+        if (e.op == ">>") {
+          if (r < 0 || r >= 64) Error("invalid shift count in a const");
+          return l >> r;
+        }
+        if (e.op == "&") return l & r;
+        if (e.op == "|") return l | r;
+        if (e.op == "^") return l ^ r;
+        Error("unsupported operator '" + e.op + "' in array length");
+      }
+    }
+    Error("array length must be a constant integer expression");
+  }
+
+  int64_t ResolvedArrayLen(const TypeNode* t) const {
+    if (!t) Error("missing array type");
+    if (t->array_len_expr) return EvalArrayLen(*t->array_len_expr);
+    if (t->array_len < 0) Error("array length must be non-negative");
+    return t->array_len;
   }
 
   bool ExprMentionsIota(const Expr* e) const {
@@ -4615,22 +5039,43 @@ class Generator {
 
   void EmitFreeFuncProtosOrSkipMain() {}
 
-  std::string TemplatePrefix(const FuncDecl& fn) {
-    if (fn.type_params.empty()) return "";
+  std::string TemplatePrefixFrom(const std::vector<std::string>& tparams) {
+    if (tparams.empty()) return "";
     std::ostringstream oss;
     oss << "template<";
-    for (size_t i = 0; i < fn.type_params.size(); ++i) {
+    for (size_t i = 0; i < tparams.size(); ++i) {
       if (i) oss << ", ";
-      oss << "typename " << fn.type_params[i];
+      oss << "typename " << tparams[i];
     }
     oss << ">\n";
     return oss.str();
   }
 
+  std::string TemplatePrefix(const FuncDecl& fn) {
+    return TemplatePrefixFrom(fn.type_params);
+  }
+
   void EmitAliases() {
+    auto saved_tp = current_type_params_;
     for (auto& a : file_.aliases) {
-      out_ << "using " << a.name << " = " << CppType(a.type.get()) << ";\n";
+      current_type_params_ = a.type_params;
+      if (!a.type_params.empty()) out_ << TemplatePrefixFrom(a.type_params);
+      if (!a.is_alias_eq && HasMethodsOn(a.name)) {
+        std::string under = CppType(a.type.get());
+        out_ << "struct " << a.name << " {\n";
+        out_ << "  " << under << " v{};\n";
+        out_ << "  constexpr " << a.name << "() = default;\n";
+        out_ << "  constexpr " << a.name << "(" << under << " x) : v(x) {}\n";
+        out_ << "  constexpr operator " << under << "() const { return v; }\n";
+        for (auto& fn : file_.funcs) {
+          if (fn.has_receiver && fn.receiver_type == a.name) EmitMethodDecl(fn);
+        }
+        out_ << "};\n";
+      } else {
+        out_ << "using " << a.name << " = " << CppType(a.type.get()) << ";\n";
+      }
     }
+    current_type_params_ = saved_tp;
     if (!file_.aliases.empty()) out_ << "\n";
   }
 

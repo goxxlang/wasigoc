@@ -18,5 +18,15 @@ line2	"q"
 {"X":5,"Y":7}
 
 {"Label":"origin","P":{"X":0,"Y":0}}
+
+9
+4
+
+[{"X":1,"Y":2},{"X":3,"Y":4}]
+
+here
+8
 true
 true
+{"name":"bob"}
+ann

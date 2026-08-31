@@ -1,9 +1,8 @@
 // Bounded go/doc: package documentation extraction for exactly the
 // top-level declarations this project's own go/parser produces --
-// `func` declarations and single-spec `var`/`const` (no type
-// declarations at all, since go/parser doesn't parse those; see its own
-// tracker line -- so unlike real Go's go/doc, this package has no
-// `Type` documentation). `New` takes one already-parsed file (this
+// `func` declarations and single-spec `var`/`const`. Type declarations
+// parse now (see go/parser), but this package still does not extract
+// `Type` documentation -- adding that is a separate, additive step.
 // project's go/parser has no multi-file package concept, unlike real
 // go/doc.New's `*ast.Package`), plus that file's `[]scanner.Comment`
 // from `parser.ParseFileWithComments` -- comment association needs the

@@ -1,21 +1,28 @@
 #include "parser.h"
 
+#include <map>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <utility>
 
 namespace wasigo {
 
 namespace {
 
-std::unique_ptr<Stmt> MakeStmt(StmtKind k) {
+std::unique_ptr<Stmt> MakeStmtTok(StmtKind k, const Token& t) {
   auto s = std::make_unique<Stmt>();
   s->kind = k;
+  s->line = t.line;
+  s->col = t.col;
   return s;
 }
 
-std::unique_ptr<Expr> MakeLit(ExprKind k) {
+std::unique_ptr<Expr> MakeLitTok(ExprKind k, const Token& t) {
   auto e = std::make_unique<Expr>();
   e->kind = k;
+  e->line = t.line;
+  e->col = t.col;
   return e;
 }
 
@@ -76,6 +83,7 @@ class ParserImpl {
 
   File ParseFile() {
     File f;
+    file_ = &f;
     Expect(TokKind::KwPackage);
     f.package_name = ExpectIdent();
     ExpectSemi();
@@ -115,8 +123,21 @@ class ParserImpl {
   const std::vector<Token>& toks_;
   size_t pos_ = 0;
   bool allow_composite_lit_ = true;
+  File* file_ = nullptr;
+  std::map<std::string, std::string> iface_intern_;
+  int anon_iface_id_ = 0;
 
   const Token& Cur() const { return toks_[pos_]; }
+  std::unique_ptr<Expr> MakeLit(ExprKind k) { return MakeLitTok(k, Cur()); }
+  std::unique_ptr<Expr> MakeLit(ExprKind k, const Token& t) { return MakeLitTok(k, t); }
+  std::unique_ptr<Expr> MakeLit(ExprKind k, const Expr& src) {
+    auto e = MakeLitTok(k, Cur());
+    e->line = src.line;
+    e->col = src.col;
+    return e;
+  }
+  std::unique_ptr<Stmt> MakeStmt(StmtKind k) { return MakeStmtTok(k, Cur()); }
+  std::unique_ptr<Stmt> MakeStmt(StmtKind k, const Token& t) { return MakeStmtTok(k, t); }
   bool Check(TokKind k) const { return Cur().kind == k; }
   bool NextIs(TokKind k) const {
     return pos_ + 1 < toks_.size() && toks_[pos_ + 1].kind == k;
@@ -151,7 +172,8 @@ class ParserImpl {
   }
 
   [[noreturn]] void Fail(const std::string& msg) {
-    throw ParseError("line " + std::to_string(Cur().line) + ": " + msg);
+    throw ParseError("line " + std::to_string(Cur().line) + ":" +
+                     std::to_string(Cur().col) + ": " + msg);
   }
 
   std::string ExpectIdent() {
@@ -267,10 +289,13 @@ class ParserImpl {
       return t;
     }
     if (Accept(TokKind::KwInterface)) {
-      Expect(TokKind::LBrace);
-      SkipSemis();
-      Expect(TokKind::RBrace);
-      return MakeNamedType("any");
+      InterfaceDecl tmp;
+      ParseInterfaceMembers(tmp);
+      if (tmp.methods.empty() && tmp.embedded.empty()) return MakeNamedType("any");
+      if (!tmp.embedded.empty()) {
+        Fail("an anonymous interface cannot embed another interface");
+      }
+      return MakeNamedType(InternAnonIface(std::move(tmp.methods)));
     }
     if (Accept(TokKind::LBracket)) {
       if (Accept(TokKind::RBracket)) {
@@ -279,13 +304,16 @@ class ParserImpl {
         t->elem = ParseType();
         return t;
       }
-      if (!Check(TokKind::IntLit)) Fail("array length must be an integer literal");
-      int64_t n = Cur().intval;
-      Advance();
+      auto len = ParseExpr();
       Expect(TokKind::RBracket);
       auto t = std::make_unique<TypeNode>();
       t->kind = TypeKind::Array;
-      t->array_len = n;
+      if (len->kind == ExprKind::IntLit) {
+        if (len->intval < 0) Fail("array length must be non-negative");
+        t->array_len = len->intval;
+      } else {
+        t->array_len_expr = ExprToArrayLen(*len);
+      }
       t->elem = ParseType();
       return t;
     }
@@ -300,10 +328,54 @@ class ParserImpl {
       return t;
     }
     std::string first = ExpectIdent();
+    std::string pkg;
     if (Accept(TokKind::Dot)) {
-      return MakeNamedType(ExpectIdent(), first);
+      pkg = first;
+      first = ExpectIdent();
     }
-    return MakeNamedType(std::move(first));
+    auto named = MakeNamedType(std::move(first), std::move(pkg));
+    if (Accept(TokKind::LBracket)) {
+      for (;;) {
+        named->type_args.push_back(ParseType());
+        if (!Accept(TokKind::Comma)) break;
+        if (Check(TokKind::RBracket)) break;
+      }
+      Expect(TokKind::RBracket);
+    }
+    return named;
+  }
+
+  std::unique_ptr<ArrayLenExpr> ExprToArrayLen(const Expr& e) {
+    auto n = std::make_unique<ArrayLenExpr>();
+    switch (e.kind) {
+      case ExprKind::IntLit:
+        n->kind = ArrayLenExpr::Kind::Lit;
+        n->lit = e.intval;
+        return n;
+      case ExprKind::Ident:
+        n->kind = ArrayLenExpr::Kind::Ident;
+        n->ident = e.strval;
+        return n;
+      case ExprKind::ParenExpr:
+        if (!e.x) Fail("array length must be a constant integer expression");
+        return ExprToArrayLen(*e.x);
+      case ExprKind::Unary:
+        n->kind = ArrayLenExpr::Kind::Unary;
+        n->op = e.strval;
+        if (!e.x) Fail("array length must be a constant integer expression");
+        n->x = ExprToArrayLen(*e.x);
+        return n;
+      case ExprKind::Binary:
+        n->kind = ArrayLenExpr::Kind::Binary;
+        n->op = e.strval;
+        if (!e.x || !e.y) Fail("array length must be a constant integer expression");
+        n->x = ExprToArrayLen(*e.x);
+        n->y = ExprToArrayLen(*e.y);
+        return n;
+      default:
+        Fail("array length must be a constant integer expression");
+    }
+    return nullptr;
   }
 
   // ---- Expressions --------------------------------------------------------
@@ -325,7 +397,7 @@ class ParserImpl {
       std::string op = Cur().text;
       Advance();
       auto rhs = ParseBinary(prec + 1);
-      auto e = MakeLit(ExprKind::Binary);
+      auto e = MakeLit(ExprKind::Binary, *lhs);
       e->strval = op;
       e->x = std::move(lhs);
       e->y = std::move(rhs);
@@ -336,17 +408,16 @@ class ParserImpl {
 
   std::unique_ptr<Expr> ParseUnary() {
     if (Check(TokKind::Arrow)) {
-      Advance();
       auto e = MakeLit(ExprKind::Recv);
+      Advance();
       e->x = ParseUnary();
       return e;
     }
     if (Check(TokKind::Not) || Check(TokKind::Minus) || Check(TokKind::Amp) ||
         Check(TokKind::Star) || Check(TokKind::Plus) || Check(TokKind::Caret)) {
-      std::string op = Cur().text;
-      Advance();
       auto e = MakeLit(ExprKind::Unary);
-      e->strval = op;
+      e->strval = Cur().text;
+      Advance();
       e->x = ParseUnary();
       return e;
     }
@@ -358,7 +429,7 @@ class ParserImpl {
     for (;;) {
       if (Accept(TokKind::Dot)) {
         if (Accept(TokKind::LParen)) {
-          auto ta = MakeLit(ExprKind::TypeAssert);
+          auto ta = MakeLit(ExprKind::TypeAssert, *e);
           ta->x = std::move(e);
           if (Accept(TokKind::KwType)) {
             ta->type_switch = true;
@@ -370,7 +441,7 @@ class ParserImpl {
           continue;
         }
         std::string name = ExpectIdent();
-        auto sel = MakeLit(ExprKind::Selector);
+        auto sel = MakeLit(ExprKind::Selector, *e);
         sel->x = std::move(e);
         sel->strval = name;
         e = std::move(sel);
@@ -381,7 +452,7 @@ class ParserImpl {
           continue;
         }
       } else if (Accept(TokKind::LParen)) {
-        auto call = MakeLit(ExprKind::Call);
+        auto call = MakeLit(ExprKind::Call, *e);
         call->callee = std::move(e);
         if (!Check(TokKind::RParen)) {
           auto arg = ParseExpr();
@@ -398,7 +469,7 @@ class ParserImpl {
         e = std::move(call);
       } else if (Accept(TokKind::LBracket)) {
         if (Accept(TokKind::Colon)) {
-          auto sl = MakeLit(ExprKind::SliceExpr);
+          auto sl = MakeLit(ExprKind::SliceExpr, *e);
           sl->x = std::move(e);
           if (!Check(TokKind::Colon) && !Check(TokKind::RBracket)) sl->high = ParseExpr();
           if (Accept(TokKind::Colon)) {
@@ -410,7 +481,7 @@ class ParserImpl {
         } else {
           auto first = ParseExpr();
           if (Accept(TokKind::Colon)) {
-            auto sl = MakeLit(ExprKind::SliceExpr);
+            auto sl = MakeLit(ExprKind::SliceExpr, *e);
             sl->x = std::move(e);
             sl->low = std::move(first);
             if (!Check(TokKind::Colon) && !Check(TokKind::RBracket)) sl->high = ParseExpr();
@@ -421,7 +492,7 @@ class ParserImpl {
             Expect(TokKind::RBracket);
             e = std::move(sl);
           } else {
-            auto idx = MakeLit(ExprKind::Index);
+            auto idx = MakeLit(ExprKind::Index, *e);
             idx->x = std::move(e);
             idx->y = std::move(first);
             Expect(TokKind::RBracket);
@@ -495,44 +566,52 @@ class ParserImpl {
     const Token& t = Cur();
     switch (t.kind) {
       case TokKind::IntLit: {
-        Advance();
-        auto e = MakeLit(ExprKind::IntLit);
+        auto e = MakeLit(ExprKind::IntLit, t);
         e->intval = t.intval;
+        Advance();
         return e;
       }
       case TokKind::RuneLit: {
-        Advance();
-        auto e = MakeLit(ExprKind::IntLit);
+        auto e = MakeLit(ExprKind::IntLit, t);
         e->intval = t.intval;
+        Advance();
         return e;
       }
       case TokKind::FloatLit: {
-        Advance();
-        auto e = MakeLit(ExprKind::FloatLit);
+        auto e = MakeLit(ExprKind::FloatLit, t);
         e->floatval = t.floatval;
+        Advance();
+        return e;
+      }
+      case TokKind::ImagLit: {
+        auto e = MakeLit(ExprKind::ImagLit, t);
+        e->floatval = t.floatval;
+        Advance();
         return e;
       }
       case TokKind::StringLit: {
-        Advance();
-        auto e = MakeLit(ExprKind::StringLit);
+        auto e = MakeLit(ExprKind::StringLit, t);
         e->strval = t.text;
+        Advance();
         return e;
       }
       case TokKind::KwTrue: {
-        Advance();
-        auto e = MakeLit(ExprKind::BoolLit);
+        auto e = MakeLit(ExprKind::BoolLit, t);
         e->boolval = true;
+        Advance();
         return e;
       }
       case TokKind::KwFalse: {
-        Advance();
-        auto e = MakeLit(ExprKind::BoolLit);
+        auto e = MakeLit(ExprKind::BoolLit, t);
         e->boolval = false;
+        Advance();
         return e;
       }
-      case TokKind::KwNil:
+      case TokKind::KwNil: {
+        auto e = MakeLit(ExprKind::Nil, t);
         Advance();
-        return MakeLit(ExprKind::Nil);
+        return e;
+      }
       case TokKind::LParen: {
         Advance();
         bool saved = allow_composite_lit_;
@@ -540,7 +619,7 @@ class ParserImpl {
         auto inner = ParseExpr();
         allow_composite_lit_ = saved;
         Expect(TokKind::RParen);
-        auto e = MakeLit(ExprKind::ParenExpr);
+        auto e = MakeLit(ExprKind::ParenExpr, t);
         e->x = std::move(inner);
         return e;
       }
@@ -566,7 +645,7 @@ class ParserImpl {
           Advance();
           return ParseCompositeLitBody(MakeNamedType(name));
         }
-        return MakeIdent(name);
+        return MakeIdent(name, t.line, t.col);
       }
       default:
         Fail("expected an expression but found " +
@@ -575,6 +654,7 @@ class ParserImpl {
   }
 
   std::unique_ptr<Expr> ParseFuncLit() {
+    const Token kw = Cur();
     Expect(TokKind::KwFunc);
     auto fl = std::make_unique<FuncLit>();
     Expect(TokKind::LParen);
@@ -594,7 +674,7 @@ class ParserImpl {
       fl->results.push_back(ParseType());
     }
     fl->body = ParseBlock();
-    auto e = MakeLit(ExprKind::FuncLit);
+    auto e = MakeLit(ExprKind::FuncLit, kw);
     e->func_lit = std::move(fl);
     return e;
   }
@@ -632,16 +712,21 @@ class ParserImpl {
   }
 
   void ParseVarGroupInto(std::vector<std::unique_ptr<Stmt>>& out) {
+    bool is_const = Check(TokKind::KwConst);
     Advance();  // 'var' or 'const'
     if (Accept(TokKind::LParen)) {
       SkipSemis();
       while (!Check(TokKind::RParen)) {
-        out.push_back(ParseOneVarSpec());
+        auto s = ParseOneVarSpec();
+        s->is_const = is_const;
+        out.push_back(std::move(s));
         SkipSemis();
       }
       Expect(TokKind::RParen);
     } else {
-      out.push_back(ParseOneVarSpec());
+      auto s = ParseOneVarSpec();
+      s->is_const = is_const;
+      out.push_back(std::move(s));
     }
   }
 
@@ -792,35 +877,37 @@ class ParserImpl {
       case TokKind::KwReturn:
         return ParseReturnStmt();
       case TokKind::KwBreak: {
-        Advance();
         auto s = MakeStmt(StmtKind::Break);
+        Advance();
         if (Check(TokKind::Ident)) s->names.push_back(ExpectIdent());
         return s;
       }
       case TokKind::KwContinue: {
-        Advance();
         auto s = MakeStmt(StmtKind::Continue);
+        Advance();
         if (Check(TokKind::Ident)) s->names.push_back(ExpectIdent());
         return s;
       }
       case TokKind::KwGoto: {
-        Advance();
         auto s = MakeStmt(StmtKind::Goto);
+        Advance();
         s->names.push_back(ExpectIdent());
         return s;
       }
-      case TokKind::KwFallthrough:
+      case TokKind::KwFallthrough: {
+        auto s = MakeStmt(StmtKind::Fallthrough);
         Advance();
-        return MakeStmt(StmtKind::Fallthrough);
+        return s;
+      }
       case TokKind::KwGo: {
-        Advance();
         auto s = MakeStmt(StmtKind::Go);
+        Advance();
         s->lhs.push_back(ParseExpr());
         return s;
       }
       case TokKind::KwDefer: {
-        Advance();
         auto s = MakeStmt(StmtKind::Defer);
+        Advance();
         s->lhs.push_back(ParseExpr());
         return s;
       }
@@ -839,6 +926,7 @@ class ParserImpl {
   }
 
   std::unique_ptr<Stmt> ParseIfStmt() {
+    const Token kw = Cur();
     Expect(TokKind::KwIf);
     bool saved = allow_composite_lit_;
     allow_composite_lit_ = false;
@@ -853,7 +941,7 @@ class ParserImpl {
     auto cond = ParseExpr();
     allow_composite_lit_ = saved;
     auto body = ParseBlock();
-    auto s = MakeStmt(StmtKind::If);
+    auto s = MakeStmt(StmtKind::If, kw);
     s->init = std::move(init);
     s->cond = std::move(cond);
     s->body = std::move(body);
@@ -869,8 +957,8 @@ class ParserImpl {
   }
 
   std::unique_ptr<Stmt> ParseReturnStmt() {
-    Expect(TokKind::KwReturn);
     auto s = MakeStmt(StmtKind::Return);
+    Expect(TokKind::KwReturn);
     if (!Check(TokKind::Semi) && !Check(TokKind::RBrace)) {
       s->rhs = ParseExprList();
     }
@@ -932,10 +1020,11 @@ class ParserImpl {
   }
 
   std::unique_ptr<Stmt> ParseForStmt() {
+    const Token kw = Cur();
     Expect(TokKind::KwFor);
 
     if (Check(TokKind::LBrace)) {
-      auto s = MakeStmt(StmtKind::ForInfinite);
+      auto s = MakeStmt(StmtKind::ForInfinite, kw);
       s->body = ParseBlock();
       return s;
     }
@@ -959,7 +1048,7 @@ class ParserImpl {
       allow_composite_lit_ = saved;
       auto body = ParseBlock();
 
-      auto s = MakeStmt(StmtKind::ForRange);
+      auto s = MakeStmt(StmtKind::ForRange, kw);
       s->range_expr = std::move(rexpr);
       s->body = std::move(body);
       (void)declares;
@@ -984,7 +1073,7 @@ class ParserImpl {
       auto cond = ParseExpr();
       allow_composite_lit_ = saved;
       auto body = ParseBlock();
-      auto s = MakeStmt(StmtKind::ForCond);
+      auto s = MakeStmt(StmtKind::ForCond, kw);
       s->cond = std::move(cond);
       s->body = std::move(body);
       return s;
@@ -1013,7 +1102,7 @@ class ParserImpl {
     allow_composite_lit_ = saved_header;
 
     auto body = ParseBlock();
-    auto s = MakeStmt(StmtKind::ForClassic);
+    auto s = MakeStmt(StmtKind::ForClassic, kw);
     s->init = std::move(init);
     s->cond = std::move(cond);
     s->post = std::move(post);
@@ -1038,6 +1127,7 @@ class ParserImpl {
   }
 
   std::unique_ptr<Stmt> ParseSwitchStmt() {
+    const Token kw = Cur();
     Expect(TokKind::KwSwitch);
     bool saved = allow_composite_lit_;
     allow_composite_lit_ = false;
@@ -1056,7 +1146,7 @@ class ParserImpl {
     }
     allow_composite_lit_ = saved;
     Expect(TokKind::LBrace);
-    auto s = MakeStmt(StmtKind::Switch);
+    auto s = MakeStmt(StmtKind::Switch, kw);
     if (init && init->kind == StmtKind::ShortVarDecl && init->rhs.size() == 1 &&
         init->rhs[0] && init->rhs[0]->kind == ExprKind::TypeAssert &&
         init->rhs[0]->type_switch) {
@@ -1101,9 +1191,10 @@ class ParserImpl {
   }
 
   std::unique_ptr<Stmt> ParseSelectStmt() {
+    const Token kw = Cur();
     Expect(TokKind::KwSelect);
     Expect(TokKind::LBrace);
-    auto s = MakeStmt(StmtKind::Select);
+    auto s = MakeStmt(StmtKind::Select, kw);
     SkipSemis();
     while (!Check(TokKind::RBrace) && !Check(TokKind::Eof)) {
       SelectCase c;
@@ -1244,21 +1335,14 @@ class ParserImpl {
       fn.receiver_name = ExpectIdent();
       fn.receiver_is_pointer = Accept(TokKind::Star);
       fn.receiver_type = ExpectIdent();
+      if (Accept(TokKind::LBracket)) {
+        ParseTypeParamNames(fn.type_params);
+      }
       Expect(TokKind::RParen);
     }
     fn.name = ExpectIdent();
     if (Accept(TokKind::LBracket)) {
-      for (;;) {
-        fn.type_params.push_back(ExpectIdent());
-        if (!Check(TokKind::Comma) && !Check(TokKind::RBracket)) {
-          if (LooksLikeTypeStart(Cur().kind) || Check(TokKind::Ident)) {
-            (void)ParseType();  // constraint; C++ templates don't need it
-          }
-        }
-        if (!Accept(TokKind::Comma)) break;
-        if (Check(TokKind::RBracket)) break;
-      }
-      Expect(TokKind::RBracket);
+      ParseTypeParamNames(fn.type_params);
     }
     Expect(TokKind::LParen);
     fn.params = ParseParamList(&fn.variadic);
@@ -1294,6 +1378,10 @@ class ParserImpl {
           fd.type = ParseType();
         }
       }
+      if (Check(TokKind::StringLit)) {
+        fd.tag = Cur().text;
+        Advance();
+      }
       sd.fields.push_back(std::move(fd));
       SkipSemis();
     }
@@ -1304,6 +1392,11 @@ class ParserImpl {
     InterfaceDecl id;
     id.name = std::move(name);
     Expect(TokKind::KwInterface);
+    ParseInterfaceMembers(id);
+    return id;
+  }
+
+  void ParseInterfaceMembers(InterfaceDecl& id) {
     Expect(TokKind::LBrace);
     SkipSemis();
     while (!Check(TokKind::RBrace)) {
@@ -1334,7 +1427,88 @@ class ParserImpl {
       SkipSemis();
     }
     Expect(TokKind::RBrace);
-    return id;
+  }
+
+  void ParseTypeParamNames(std::vector<std::string>& tparams) {
+    for (;;) {
+      tparams.push_back(ExpectIdent());
+      if (!Check(TokKind::Comma) && !Check(TokKind::RBracket)) {
+        if (LooksLikeTypeStart(Cur().kind) || Check(TokKind::Ident)) {
+          (void)ParseType();
+        }
+      }
+      if (!Accept(TokKind::Comma)) break;
+      if (Check(TokKind::RBracket)) break;
+    }
+    Expect(TokKind::RBracket);
+  }
+
+  std::string TypeKey(const TypeNode* t) {
+    if (!t) return "?";
+    switch (t->kind) {
+      case TypeKind::Named: {
+        std::string s = t->pkg.empty() ? t->name : t->pkg + "." + t->name;
+        if (!t->type_args.empty()) {
+          s += "[";
+          for (size_t i = 0; i < t->type_args.size(); ++i) {
+            if (i) s += ",";
+            s += TypeKey(t->type_args[i].get());
+          }
+          s += "]";
+        }
+        return s;
+      }
+      case TypeKind::Pointer:
+        return "*" + TypeKey(t->elem.get());
+      case TypeKind::Slice:
+        return "[]" + TypeKey(t->elem.get());
+      case TypeKind::Map:
+        return "map[" + TypeKey(t->key.get()) + "]" + TypeKey(t->elem.get());
+      case TypeKind::Chan:
+        return "chan " + TypeKey(t->elem.get());
+      case TypeKind::Array:
+        return "[N]" + TypeKey(t->elem.get());
+      case TypeKind::Func: {
+        std::string s = "func(";
+        for (size_t i = 0; i < t->func_params.size(); ++i) {
+          if (i) s += ",";
+          s += TypeKey(t->func_params[i].type.get());
+        }
+        s += ")";
+        for (size_t i = 0; i < t->func_results.size(); ++i) s += TypeKey(t->func_results[i].get());
+        return s;
+      }
+    }
+    return "?";
+  }
+
+  std::string IfaceKey(const std::vector<MethodSig>& methods) {
+    std::ostringstream oss;
+    for (auto& m : methods) {
+      oss << m.name << "(";
+      for (size_t i = 0; i < m.params.size(); ++i) {
+        if (i) oss << ",";
+        oss << TypeKey(m.params[i].type.get());
+      }
+      oss << ")";
+      for (auto& r : m.results) oss << TypeKey(r.get());
+      oss << ";";
+    }
+    return oss.str();
+  }
+
+  std::string InternAnonIface(std::vector<MethodSig> methods) {
+    std::string key = IfaceKey(methods);
+    auto it = iface_intern_.find(key);
+    if (it != iface_intern_.end()) return it->second;
+    if (!file_) Fail("anonymous interface outside a file");
+    std::string name = "__Iface" + std::to_string(anon_iface_id_++);
+    iface_intern_[key] = name;
+    InterfaceDecl id;
+    id.name = name;
+    id.methods = std::move(methods);
+    file_->interfaces.push_back(std::move(id));
+    return name;
   }
 
   void ParseTypeDecl(File& f) {
@@ -1353,16 +1527,32 @@ class ParserImpl {
 
   void ParseOneTypeSpec(File& f) {
     std::string name = ExpectIdent();
+    std::vector<std::string> tparams;
+    if (Accept(TokKind::LBracket)) ParseTypeParamNames(tparams);
     if (Check(TokKind::KwStruct)) {
       StructDecl sd;
       sd.name = std::move(name);
+      sd.type_params = std::move(tparams);
       ParseStructFields(sd);
       f.structs.push_back(std::move(sd));
     } else if (Check(TokKind::KwInterface)) {
-      f.interfaces.push_back(ParseInterfaceBody(std::move(name)));
+      if (!tparams.empty()) Fail("generic interfaces are not supported");
+      InterfaceDecl id = ParseInterfaceBody(std::move(name));
+      std::string key = IfaceKey(id.methods);
+      auto it = iface_intern_.find(key);
+      if (it != iface_intern_.end() && it->second != id.name) {
+        TypeAlias a;
+        a.name = id.name;
+        a.type = MakeNamedType(it->second);
+        f.aliases.push_back(std::move(a));
+      } else {
+        iface_intern_[key] = id.name;
+        f.interfaces.push_back(std::move(id));
+      }
     } else {
       TypeAlias a;
       a.name = std::move(name);
+      a.type_params = std::move(tparams);
       a.is_alias_eq = Accept(TokKind::Assign);
       a.type = ParseType();
       f.aliases.push_back(std::move(a));
