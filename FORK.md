@@ -8,6 +8,8 @@ defined-type methods, generic named types, anonymous interfaces,
 range-over-func) was developed in a `~/go++` working copy and merged
 back here.
 
+Release 0.2.1 is ready to roll from `~/go++` with the builtin `gocvm`.
+
 WASI preview 1 still has no sockets. The userspace stack is `net.Pipe`:
 
 | API | What it is |
