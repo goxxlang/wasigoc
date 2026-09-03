@@ -412,7 +412,8 @@ void LoadFileInto(const std::string& path, const std::string& content, LoadState
 }  // namespace
 
 bool IsBuiltinImport(const std::string& path) {
-  return path == "fmt" || path == "errors" || path == "os" || path == "reflect";
+  return path == "fmt" || path == "errors" || path == "os" || path == "reflect" ||
+         path == "gocvm";
 }
 
 LoadedGraph LoadModuleGraph(const std::string& entry_path,

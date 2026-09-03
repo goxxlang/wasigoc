@@ -726,6 +726,24 @@ design (see `ResultStructName`) reaching a case it hadn't before:
   operand in `std::string(...)` when both sides of a `+` are string
   literals.
 
+Adding real directory listing (`os.Stat`/`os.ReadDir`, driven by
+NewBrowser's goxxlang port of `bundle.Collect` needing it -- see that
+repo's README) found one more general bug, in `EmitCall`'s "call a local
+variable of `func` type" branch (the one that handles calling a callback
+parameter like `filepath.WalkDir`'s own `fn`, as opposed to a package
+function or method, which go through `EmitArgsFor` and already get this
+right): it emitted every argument with plain `EmitExpr`, never
+`EmitExprAs`, so an untyped `nil` argument for a non-pointer parameter
+(`error`, calling `fn(path, d, nil)` from `WalkDir`'s own body) came out
+as literal C++ `nullptr` -- correct for a pointer parameter, but
+`wasigo::Error` has no `nullptr_t` constructor, only the `==`/`!=`
+comparison overloads `NilSpellingFor` already exists to get right
+(`{}` for `error`/`any`/slice/map/chan/func, `""` for `string`, `nullptr`
+only for a real pointer). Fixed by resolving the call's `TypeKind::Func`
+underlying type and running each argument through `EmitExprAs` against
+that parameter's declared type, the same as `EmitArgsFor` already did for
+every other kind of call.
+
 ### How to grow it
 
 1. Write Go under `stdlib/<path>/*.go` (skip `*_test.go`; directory = one
@@ -745,7 +763,7 @@ design (see `ResultStructName`) reaching a case it hadn't before:
 | --- | --- | --- |
 | `fmt` | `Print`/`Println`/`Sprint`/`Sprintln`/`Printf`/`Sprintf`/`Errorf`/`Fprint`/`Fprintln`/`Fprintf` | `Fprint*`'s writer must be `os.Stdout`/`os.Stderr` written directly (unaliased) or a concrete `.Write`-having value -- a variable holding `os.Stdout` works as an `io.Writer` (real `os.File`) but not as `Fprint*`'s special-cased fast path. No `Scan*`. Format must be a **string literal**; verbs only `%d %s %f %v %t %c %w(Errorf only) %%`, no width/precision |
 | `errors` | `New`, `Is` (chain-walking string-equal), `Unwrap`, `Join` | `As` (needs a runtime type-comparison feature this compiler doesn't have) |
-| `os` | `Args`, `Exit`, `Getenv`, `File` (`Open`/`Create`/`ReadFile`/`WriteFile`, `Read`/`Write`/`Close`), `Stdout`/`Stdin`/`Stderr` | dirs, `Setenv`, process, `Remove`/`Mkdir`/`Stat` -- most non-file-content I/O |
+| `os` | `Args`, `Exit`, `Getenv`, `File` (`Open`/`Create`/`ReadFile`/`WriteFile`, `Read`/`Write`/`Close`), `Stdout`/`Stdin`/`Stderr`, `Stat`/`FileInfo` (`Name`/`Size`/`IsDir`, via real `stat(2)`), `ReadDir`/`DirEntry` (`Name`/`IsDir`, via real `opendir`/`readdir`/`closedir` -- genuine WASI `fd_readdir`, not a stub) | `Setenv`, process, `Remove`/`Mkdir`; `FileInfo` has no `Mode`/`ModTime`/`Sys` |
 | `reflect` | `TypeOf`/`ValueOf`; `Value`/`Type` (both literally `wasigo::Any`) with `Kind`/`Name`/`NumField`/`Field`/`FieldName`/`Interface`/`Int`/`Float`/`Bool`/`String`; Kind constants (`Invalid`/`Bool`/`Int8`.../`Struct`) | No `Set*` (read-only, no addressable values); no Slice/Map/Chan/Func Kind (reports `Invalid`); same-width Go type pairs (`int`/`int64`, `byte`/`uint8`, ...) share one Kind, can't tell them apart |
 
 ### Compiled Go under `stdlib/`
@@ -756,7 +774,7 @@ design (see `ResultStructName`) reaching a case it hadn't before:
 | `bytes` | Equal/Index/Contains/Repeat/IndexByte, Trim/TrimLeft/TrimRight/TrimSpace, Clone, Cut, Replace/ReplaceAll, Split, Join, ToUpper/ToLower, HasPrefix/HasSuffix, `Buffer` (+ `Read`), `Reader`+`NewReader` (Len/Size/Read/ReadByte) | Reader has no Seek/ReadRune |
 | `strconv` | `Itoa`/`Atoi`, `FormatBool`/`ParseBool`, `ParseFloat` (no exponent), `FormatInt`/`FormatUint` (any base 2-36), `ParseInt`/`ParseUint` (any base, base 0 auto-detects `0x`/`0o`/`0b`/leading-0 octal), `Quote` | No `FormatFloat`/`Append*`, `Quote` has no `\u` escaping |
 | `path` | `Base`/`Dir`/`Ext`/`Join`/`Clean`/`Split`/`IsAbs` | No `Match` |
-| `path/filepath` | Same as `path`, plus no-op `ToSlash`/`FromSlash` | Slash-only on WASI; no `Walk`, `Abs`, `Rel`, `Glob`, `EvalSymlinks` |
+| `path/filepath` | Same as `path`, plus no-op `ToSlash`/`FromSlash`, `Rel`, `WalkDir`/`SkipDir` (built on `os.ReadDir`) | Slash-only on WASI; no `Walk` (the pre-`fs.DirEntry` variant), `Abs` (no `os.Getwd`), `Glob`, `EvalSymlinks`; `WalkDir` never visits `root` itself, only descendants |
 | `io` | `Writer`/`Reader`/`Closer`/`StringWriter`, `EOF`, `ErrUnexpectedEOF`, `Copy`, `ReadAll`, `WriteString` | No `MultiWriter`, `LimitReader`, `Seeker`, `Pipe` |
 | `math` | Abs/Min/Max/Sqrt(Newton)/Floor/Ceil/Trunc/Mod/Copysign/Signbit/Inf/NaN/IsNaN/IsInf/Exp/Log/Log2/Log10/Pow/Hypot (Exp/Log via range-reduction + series, no libm) | No trig (Sin/Cos/Tan); no `math/rand` |
 | `sort` | Insertion Ints/Strings/Float64s + `*AreSorted`, `Interface`+`Sort`+`IsSorted`, generic `Slice`/`SliceStable`/`SliceIsSorted`, `Search`+`SearchInts`/`SearchStrings`/`SearchFloat64s` | `Slice` is generic (`[]T`), not reflection-based like real `sort.Slice(x any, ...)` -- see stdlib/sort |
@@ -1088,6 +1106,401 @@ trailing-content-after-block edge cases) -- byte-identical between host
 g++ and real wasmtime -- plus the FULL suite re-run (141/141, zero
 regressions).
 
+**Three more general compiler bugs, all found the same way as the very
+first entries in this diary: real downstream Go source hitting the
+parser, not a package built to exercise a known gap on purpose.**
+`~/project_lovelace` (a sibling project vendoring the real
+`internal/wasmbin`/`internal/wasmdecomp` decompiler packages through
+this compiler to build a standalone WASI guest) had worked around
+several `wasigoc` limitations directly in its own vendored source rather
+than here, exactly the kind of note this project's own docs ask to be
+followed up on. Revisiting that list surfaced three that were real,
+general parser/codegen bugs, not narrow enough to leave as a workaround:
+
+- **`type Name [N]T` (a named array or slice type) was completely
+  broken**, both loudly and silently. `ParseOneTypeSpec` treated ANY `[`
+  right after a type name as the start of a generic type-parameter list
+  (`type Set[T any] struct{...}`) unconditionally, calling
+  `ParseTypeParamNames` (which immediately does `ExpectIdent()`) no
+  matter what actually followed. `type block [64]int32` (found in this
+  project's OWN `stdlib/image/jpeg/jpeg.go`, apparently never actually
+  exercised end to end -- the `jpegpkg` golden was building generated
+  C++ that never got this far) failed outright: "expected an identifier
+  but found int literal", `64` obviously not being an identifier. Worse,
+  `type Named [maxSize]byte` (a named constant as the array length, a
+  perfectly ordinary Go pattern) didn't error at all -- `maxSize` IS an
+  identifier, so it silently got consumed as a bogus one-element generic
+  parameter list instead, producing a nonsense type. A named SLICE type
+  (`type ByteSlice []byte`) was equally broken (`[]` immediately calls
+  `ExpectIdent()` against `]`) and, grepped across the entire project,
+  had never once been written in this project's own stdlib or examples
+  -- a real, total coverage gap hiding behind "nobody happened to need
+  it yet." Fixed with a 2-token lookahead (`LooksLikeTypeParamList`) at
+  the one call site: a `[` is only ever a type-parameter list when it's
+  followed by an identifier AND that identifier is followed by something
+  other than `]` (Go's own generic constraint syntax always needs a
+  constraint after the name; `[N]` alone can never be valid type params,
+  only an array length). Otherwise the `[` is left unconsumed for
+  `ParseType()`'s own already-correct slice/array handling to pick up
+  normally, the same code path `var` declarations already used
+  correctly.
+- **Grouped struct field names (`A, B T`, Go's ordinary shorthand for
+  two same-typed fields) weren't supported at all** -- exactly the
+  `Module, Name string` shape `project_lovelace` had hand-expanded to
+  one field per line to work around. `ParseParamList` already handled
+  the identical ambiguity correctly for function parameters (collect
+  names in a loop, then parse ONE shared type), but `ParseStructFields`
+  had never grown the same handling -- it read one identifier, and
+  either treated it as a whole embedded field or immediately called
+  `ParseType()`, with no comma-loop in between. Fixed by giving struct
+  fields the same shape ParamList already has: collect one or more
+  comma-separated names, parse the shared type and optional tag once,
+  then emit one `FieldDecl` per name (`CloneType` per field, matching
+  how `ParseParamList` already clones a shared type across grouped
+  params).
+- **A generic struct instantiated directly as an expression-position
+  composite literal (`Pair[int]{A: 1, B: 2}`, as opposed to a `var s
+  Set[int]` declaration -- the only shape any earlier stdlib/example
+  code had ever used) failed two different ways in sequence.** First a
+  parse failure: `ParsePostfix`'s `[` handling has no concept of "this
+  could be a type," so `Pair[int]` parsed as an ordinary `Index`
+  expression (`Pair` indexed by `int`), and the `{` immediately after
+  had nowhere to go, surfacing nowhere near the real cause ("expected
+  ':=' or '=' after a comma-separated expression list", from statement
+  parsing much further up the call stack). Fixed by recognizing the
+  shape in `ParsePostfix` itself: a single bracketed entry immediately
+  followed by `{` (only possible for a type, since a real Go index
+  expression can never be directly followed by an unparenthesized `{`)
+  or 2+ comma-separated entries in `[...]` (never valid indexing syntax
+  at all -- indexing takes exactly one expression) both get reinterpreted
+  as type arguments via a new small `TypeArgExprToType` helper (handling
+  the identifier/qualified-name/pointer shapes an already-parsed
+  expression can actually take), and the whole `Name[Args]{...}` becomes
+  a composite literal the same way a plain `Name{...}` already does.
+  Second, once parsing was fixed, a codegen failure: `EmitCompositeLit`
+  built the struct's synthesized IIFE as `Pair __s{}; ...`, relying on
+  C++ class template argument deduction to pick up `T` -- but CTAD has
+  no constructor argument to deduce anything FROM at that point (the
+  struct is default-constructed, then fields assigned one by one
+  afterward), so it fails outright ("no matching function for call to
+  'Pair()'"). Fixed by using the already-correct `CppType`/`NamedCppType`
+  (which already knows how to append `<Args>` from `type_args`, used
+  everywhere else a generic type name is spelled) instead of a bare
+  `QualName` call, so the IIFE declares the fully-instantiated
+  `Pair<int64_t> __s{};` up front.
+
+New golden `examples/typedecl` (`type Name []T`/`[N]T` with both a
+literal and a named-constant length, grouped struct field names on a
+2-field and a 3-field struct, and `Pair[int]{...}`/`Map2[string,
+int]{...}` generic composite-literal instantiation with one and two
+type arguments) -- 7 checks, matching between host g++ and real
+`wasmtime`. Full suite re-run after all three fixes: 277/278 (the one
+failure, `runtime_smoketest`, is a pre-existing, unrelated host
+panic/recover-on-closed-channel test that never touches
+`parser.cc`/`cpp_generator.cc`, the only two files this round changed).
+
+**GocVM (2026-09-03): one compiler-known dispatch gate, not per-package
+FFI.** Sibling project `~/shim_sandbox` made its 8 "extra G++" stub
+topics (net/os.exec/os.user/syscall/tls -- see its own
+docs/architecture.md) real (Winsock/Win32 backends), but `os/exec`,
+`os/user`, `syscall`, `net`, and `crypto/tls` here are ordinary parsed
+Go++ source with no way to reach hand-written C++ at all -- only `os`
+gets that treatment, as one of the compiler's few special-cased builtin
+packages (`BuildOsBuiltinFile`, `module_loader.cc`'s
+`IsBuiltinImport`). Rather than repeating that whole-package-builtin
+treatment four more times, or inventing a generic bodyless-extern
+mechanism, added **one** new builtin function following the exact same
+precedent `os.Getenv` already set: `gocvm.Call(topic, payload string)
+(string, error)` (`BuildGocvmBuiltinFile` in `cpp_generator.cc`, one
+`EmitCall` branch, one `ResolveCalledFunc` branch so `s, err :=
+gocvm.Call(...)` unpacks through the ordinary multi-return path like
+`os.Open` already does -- `wasigo::gocvm::CallResult{r0, r1}` matches
+`OsOpenResult`'s exact `rN`-field shape on purpose).
+
+The dispatch primitive itself (`wasigo::gocvm::Call`, `src/runtime.hpp`)
+is a small pluggable-bridge pattern: a `HostBridge` interface (default:
+`kNoBridge`, the same honest "not supported" shape every existing stub
+already had) plus an `AbacHook` interface (default: allow-all -- richer
+per-caller ABAC is future work, not needed yet). Registration is
+explicit, not static-init-across-a-static-library-archive (a linker can
+silently drop an unreferenced `.o` from a `.a` with no
+`--whole-archive`): `wasigo::set_os_args`, already called identically by
+both of `cpp_generator.cc`'s `main()` shapes, calls
+`wasigo_gocvm_install_bridge()` when built with `-DWASIGO_GOCVM_BRIDGE=1`
+-- `goclang++.bat --shim-sandbox` now passes that flag, and
+`shim_sandbox/src/gocvm_bridge.cc` supplies the real bridge, a thin
+adapter over its existing `W2gSapiHandle` (zero duplicated logic).
+
+Per the user's explicit request, GocVM also doubles as the virtual-
+goroutine registry, reusing this project's existing Oilpan-lite cppgc
+(`gc::GarbageCollected`/`Persistent`, not a new allocator): a
+`gocvm::VThread` is allocated and stored as a `gc::Persistent<VThread>`
+field directly on `Task`/`TaskT<T>`'s `promise_type`, set only in the
+three `go()` overloads (not on every `co_await`-helper coroutine --
+same distinction Go's own `go` statement draws) -- so a spawned
+goroutine's registry entry is rooted for exactly its coroutine frame's
+lifetime with no separate list to keep in sync by hand, and no
+`UnregisterThread` call site needed at all.
+
+**Real bug hit along the way**: a block-scope `extern "C" void f();`
+inside a function body is not valid C++ (a linkage-specification is
+namespace-scope only) -- clang rejects it with a confusing "expected
+unqualified-id" pointing at the linkage string itself, not an "extern
+not allowed here" message. Moved the forward declaration up to namespace
+scope, next to (not inside) `set_os_args`.
+
+**Also found while wiring this in**: `shim_sandbox`'s own CMake sibling
+search (`../wasigoc`, `../WASIGo++`) never looked for `../go++` -- this
+workspace's actual fork -- so it had been silently building against the
+*unforked* `~/WASIGo++/src/runtime.hpp` the entire session (harmless
+until now, since nothing shim_sandbox used had actually diverged yet).
+Fixed by adding `../go++` to that search list, checked before
+`../WASIGo++`.
+
+Wired 3 of the now-real shim_sandbox topics through `gocvm.Call` into
+real Go++ stdlib source -- `os/exec` (`Run`/`Output`/`CombinedOutput`,
+parsing real_win.cc::Exec's `"exit=<n>\n<output>"` reply), `os/user`
+(`Current`), `syscall` (`Getpid`/`Getppid`/`Getenv`/`Environ`) --
+chosen because gocvm's existing single-request/single-reply shape is
+their *complete, correct* semantic. `net.Dial`/`net.Listen`/`tls.Dial`
+are deliberately NOT wired this round: they conceptually want a live,
+usable `Conn` handed back, and shim_sandbox's 8 topics today only prove
+reachability (connect-then-close) -- wiring those for real needs a
+session/handle protocol extension first, not attempted here.
+Hand-verified end to end outside the golden-test harness (compiled a
+`.go` using `gocvm.Call` directly through wasigoc, then native clang++
+against a rebuilt `libw2g.a` with `-DWASIGO_GOCVM_BRIDGE=1`): real
+`syscall.Getpid()`-equivalent traffic returned this session's actual
+process ID, not a canned value. Every existing golden test for these
+three packages (`execpkg`/`userpkg`/`syscallpkg`) still passes unchanged
+under plain `compile.bat` (wasm32-wasip1, no bridge linked) -- confirmed
+their exact expected-output strings are still produced when
+`gocvm.Call` reports no bridge registered, since that's the same
+`errNotSupported`/canned-value fallback these packages always returned.
+Full go++ `ctest` suite re-run: 277/278 (the one failure,
+`runtime_smoketest`, is the same pre-existing host-only panic/recover
+test noted above, unrelated to this round's `runtime.hpp`/
+`module_loader.cc`/`cpp_generator.cc`/stdlib changes).
+
+**GocVM, later still (2026-09-03): live sockets/processes, real TLS --
+"complete 1:1 with go, not the limitations of wasi 1."** The 3 packages
+above had single-request/single-reply as their *complete* semantic;
+`net`, `crypto/tls`, and the rest of `os/exec`/`os/user`/`syscall` need
+a *live, stateful* resource instead. Added a handle table to
+shim_sandbox (`src/sapi/handles.h`/`.cc` -- open sockets/processes/TLS
+sessions, referenced by an opaque id) and ~12 new gocvm topics
+(`net.accept`, `net.io.read`/`write`/`readfrom`/`writeto`/`close`,
+`os.exec.start`/`wait`/`stdout.read`, `tls.io.read`/`write`/`close`,
+plus extended ops on the existing `os.user`/`syscall` topics) dispatched
+from the same single choke point (`src/sapi/handle.cc`). `net.dial`/
+`net.listen` now leave the socket **open** (a real behavior change from
+earlier this session's reachability-probe-only version) and hand back a
+handle instead of closing it.
+
+Real TLS (`shim_sandbox/src/sapi/tls_win.cc`, ~300 lines): Schannel/
+SSPI, the standard `AcquireCredentialsHandleW` + `InitializeSecurityContextW`
+client handshake loop, automatic certificate chain + hostname validation
+always on (`SCH_CRED_MANUAL_CRED_VALIDATION`/`SCH_CRED_NO_SERVERNAME_CHECK`
+never set) -- chosen over vcpkg's already-available OpenSSL specifically
+to keep `goclang++.bat`'s consumer `.exe` dependency-free (Schannel is
+part of Windows itself, `-lsecur32 -lcrypt32`, no DLL to ship). `os/user`
+`Lookup`/`LookupId` are real too (`LookupAccountNameW`/`LookupAccountSidW`
++ `NetUserGetInfo` for home dir and primary-group SID, the same approach
+real Go's own Windows `os/user` implementation uses). `syscall.Chdir`/
+`Kill` are real (`SetCurrentDirectoryW`, `OpenProcess`+`TerminateProcess`).
+
+Rewired `stdlib/net/net.go` (`Conn`/`Listener`/`PacketConn` gain a
+`real bool`/`handle string`, every op tries `gocvm.Call` first, falls
+back to the original local-loopback-only logic on `err != nil`),
+`stdlib/crypto/tls/tls.go` (`Dial` does connect+handshake in one call,
+`Read`/`Write`/`Close` map to `tls.io.*`), `stdlib/os/exec/exec.go`
+(`Start`/`Wait` -- `Start` launches an output-pump goroutine when
+`Stdout`/`Stderr` is set, `Wait` joins it via a `pumpDone` channel before
+confirming the exit code, matching real Go's Wait semantics), `stdlib/
+os/user/user.go` (`Lookup`/`LookupId`), `stdlib/syscall/syscall.go`
+(`Chdir`/`Kill`).
+
+**A modeling mistake caught before it shipped broadly**: `gocvm.Call`'s
+`(string, error)` only signals `err != nil` when there is *no real
+answer at all* (no bridge) -- a real bridge's own failure (a real
+`connect()` refused, a real `CreateProcess` error, ...) still comes back
+`err == nil` with the payload starting `"error: "` (every real_win.cc
+handler's existing convention). The first draft of several of these
+wired functions only checked `err`, so a genuine operational failure
+would have been silently misread as valid data (an "error: ..." string
+handed back as a username, or spliced into output bytes with a generic
+"exit status -1"). Fixed by adding an `isRealError(reply)` check
+(`strings.HasPrefix(reply, "error:")`) in every newly-wired function
+before treating a reply as data -- `err != nil` still means "no bridge,
+fall back to the old stub"; `err == nil && isRealError(reply)` now means
+"a real bridge gave a real, definitive failure," surfaced as a real Go
+error instead.
+
+**Two more real, general bugs found (not source-level workarounds)**:
+- `src/sapi/tls_win.cc`: `QueryContextAttributesW` returns a
+  `SECURITY_STATUS` (0 == success), not a `BOOL` -- `if
+  (!QueryContextAttributesW(...))` treated success (0, "falsy" in C++)
+  as failure, so the handshake completed but every dial then failed
+  with a confusing "QueryContextAttributes(STREAM_SIZES) failed".
+  Fixed by comparing the returned status against `SEC_E_OK` explicitly.
+- **wasigoc, `src/cpp_generator.cc`'s `EmitGo`**: `go recv.AsyncMethod(...)`
+  (a method that itself uses channels, so it returns `wasigo::Task`/
+  `TaskT<T>`) fell through to the generic "ordinary callable" fallback --
+  `wasigo::go([=]{ recv.AsyncMethod(...); })` -- which calls the method as
+  a plain statement, constructing but never starting-and-scheduling the
+  returned `Task` (never passed to `go()` or `co_await`ed), so `~Task`
+  destroys the coroutine frame before it ever runs a single line of the
+  method body. Anything waiting on a signal from that goroutine (here,
+  `os/exec.Cmd.Wait()` parked on `<-pumpDone`) deadlocks forever --
+  `Scheduler::run()`'s own "all goroutines are asleep" panic, not a hang.
+  This is exactly the kind of bug the established methodology looks
+  for, except here it was this session's *own* new code (`os/exec`'s
+  `go c.pump()`) that exercised the gap for the first time --
+  confirmed by grepping the entire `stdlib/`+`examples/` tree: no other
+  `go recv.method(...)` call exists anywhere else in the codebase, so
+  this fix changes no other package's already-golden-verified output.
+  Fixed the same way the existing free-function/package-function cases
+  in `EmitGo` already work: detect `IsAsyncMethod` on the resolved
+  method and pass the call straight to `wasigo::go(...)`.
+
+Verified end to end with real Go++ source (wasigoc -> native clang++ ->
+`libw2g.a` with `-DWASIGO_GOCVM_BRIDGE=1`, since `.bat` still can't run
+through this session's tools): a two-*process* real TCP server/client
+(a real `Listen`/`Accept` and a real `Dial`, exchanging real bytes both
+ways -- deliberately two processes, not two goroutines in one, since
+wasigo's cooperative one-OS-thread scheduler means a blocking `Accept()`
+and a blocking `Dial()` in the *same* process can't rendezvous: whichever
+runs first never yields back for the other to run, a genuine pre-existing
+limit of the model, not new to this round); and a single program doing
+real `exec.Start()`/`Wait()` with streamed `Stdout`, a real
+`user.Lookup()` matching `user.Current()`, a real `syscall.Chdir()`, and
+a real TLS handshake + HTTPS GET to a live host (`example.com`) that came
+back an actual `HTTP/1.1 200` with a real decrypted body. Full go++
+`ctest`: 277/278 (same pre-existing unrelated failure). shim_sandbox's
+own `ctest`: 2/2, extended with a real loopback socket round trip, real
+`exec.Start`/`stdout.read`/`Wait`, a real `os.user` lookup of the current
+user, and a real TLS handshake + HTTPS GET against a live host.
+
+**Deferred, not attempted**: `Cmd.Stdin` (a child's stdin is always
+wired to `NUL` -- no interactive input); separating a child's stdout
+from its stderr (the real backend combines them into one pipe, so
+`Cmd.Stderr` alone falls back to receiving the combined stream);
+`os/user.Lookup`'s home-directory guess when `NetUserGetInfo` reports
+none (`C:\Users\<name>`, the common local-account convention, not
+verified against every possible account configuration); TLS session
+renegotiation (surfaced as an honest error, not attempted); a POSIX
+`HostBridge` (still Windows-only, matching `real_posix.cc`'s existing
+honesty).
+
+**GocVM, later still (2026-09-03): tests for the ErrorState state
+machine, plus a real toolchain-level linker bug it exposed.** The
+`gocvm::Call` ErrorState machine (`kClear`/`kBridgeActive`/`kPanic`,
+`src/runtime.hpp`) had zero test coverage: every compiled golden test
+runs via `compile.bat` with no bridge linked at all (only ever exercises
+the `kNoBridge` branch), and the real `shim_sandbox` bridge never panics
+in practice, so the "a bridge call panics and must surface as a
+`wasigo::Error` instead of aborting" contract -- the entire reason
+`ErrorState`/`BridgeScope`/`panic_or_stash` exist -- had never actually
+been run. Added `tests/runtime_smoketest.cc::gocvm_error_state()`: five
+fake `HostBridge`/`AbacHook` implementations (success, a real bridge
+failure via `ok=false`, an internal panic via a `PanicFrame` unwound
+inside the bridge call exactly like compiler-emitted `goto
+__wasigo_end` does, a reentrant nested `gocvm::Call`, and an ABAC deny)
+driving `gocvm::Call` directly and asserting on both the returned
+`wasigo::Error` text and that `g_error_state` always ends back at
+`kClear` afterward -- including immediately re-using the bridge slot
+after a stashed panic, which is the case most likely to leak state if
+`BridgeScope`'s RAII guarantee ever regressed.
+
+Building this test (the first thing in the repo to link a second,
+different `HostBridge` against `runtime.hpp` while `shim_sandbox`'s
+`libw2g.a` *also* links a bridge against the same header) surfaced a
+real, general, and previously-latent linker bug, not a test bug:
+`inline thread_local ErrorState g_error_state;` (a C++17 inline
+variable) fails `shim_sandbox`'s `w2g_bridge` build with "multiple
+definition of TLS init function for wasigo::g_error_state" on this
+machine's toolchain (WinLibs mingw GCC 16.1.0 / bundled binutils) --
+every object file that includes `runtime.hpp` (each `libw2g.a` member,
+plus the executable linking against it) emits its own copy of the
+compiler-generated TLS guard/init function for the inline variable, and
+this GCC/binutils combination doesn't COMDAT-fold it away on a PE/COFF
+target, unlike ELF. `g_error_state` had existed since the GocVM entries
+above but nothing before this round ever linked two separate
+`runtime.hpp`-including binaries together in one build graph the way
+`shim_sandbox`'s own executables (`w2g_bridge`, `w2g_tests`, ...)
+already always have -- so this was latent, not new, and this round's
+test file was incidental to surfacing it, not a special trigger. Fixed
+by replacing the bare inline variable with `inline ErrorState&
+g_error_state()` wrapping a function-local `thread_local` static (the
+standard Meyer's-singleton shape, using the *function's* COMDAT folding
+rather than a bare inline-variable's TLS-init-function folding, which is
+the part this toolchain doesn't support) and updating every call site
+from `g_error_state.foo()` to `g_error_state().foo()`. Verified: `ctest`
+in both `~/go++/build-fork` (278/278) and `~/shim_sandbox/build` (2/2,
+including a full from-scratch rebuild of `w2g_bridge`/`w2g_tests` that
+previously failed to link at all) after the fix.
+
+**GocVM, later still (2026-09-03): the `err != nil` half of `isRealError`
+was never wired -- fixed across all 5 packages, then shim_sandbox+ABAC
+made the default.** Auditing every `gocvm.Call` site while adding the
+`ErrorState` test coverage above surfaced a second, more consequential
+gap than the linker bug: `isRealError`'s own doc comment, present since
+the very first GocVM entry, already correctly says `gocvm.Call`'s
+`err != nil` should mean "no bridge, fall back" -- but every call site
+in `os/exec`, `net`, `crypto/tls`, `os/user`, `syscall` actually treated
+*every* `err != nil` that way, with no code anywhere checking *why* `err`
+was non-nil. Before this round that distinction was moot (the only
+`err != nil` case in practice was genuinely no bridge), but the
+`ErrorState` machine above means a real `--shim-sandbox` build can now
+also produce `err != nil` for an ABAC deny, a bridge-internal panic, or
+(pathologically) a reentrant call -- all three would have been silently
+misreported as `errNotSupported`/`ErrNotSupported`/a canned fallback
+value, i.e. "this platform doesn't support X" on a build where it
+genuinely does and something real actually broke. `net.go`'s four
+connection-establishing functions (`Listen`/`Dial`/`ListenPacket`/
+`DialPacket`) had the same bug in inverted form (`if err == nil { real
+path }`, else silently fall through to the local-only `Pipe`-backed
+stack) -- worse there, since it produces a *successful* `Conn`/`Listener`
+that can never actually reach the requested address, not even a visible
+error.
+
+Fixed generally in all 5 packages: added `isNoBridge(err error) bool`
+(checks `err.Error()` for the exact `"no host bridge registered"`
+substring `wasigo::gocvm::kNoBridge` always includes) and changed every
+site from `if err != nil { return fallback }` to `if err != nil { if
+isNoBridge(err) { return fallback }; return err }` (net.go's four
+`err == nil`-gated sites: `if !isNoBridge(err) { return nil, err }`
+before falling through). Left `syscall.Getpid`/`Getppid`/`Environ`/
+`Getenv` unchanged -- they match real Go's own infallible signatures (no
+`error` return at all to surface anything through, same documented bound
+as real Go's `Getpid`, which also cannot fail). Verified: rebuilt +
+`ctest` for `execpkg`/`netpkg`/`tlspkg`/`userpkg`/`syscallpkg`
+individually (all pass, byte-identical output — these packages' golden
+tests all run bridge-less, so `isNoBridge` still routes every one of
+them to the exact same fallback path as before) plus the full suite
+(278/278).
+
+With that fixed, a real bridge failure can no longer be mistaken for a
+platform limitation, so the user asked to flip `goclang++.bat`'s
+`--shim-sandbox --abac` from opt-in to the default (confirmed explicitly
+over two narrower options: default just the bridge, or leave it opt-in
+and only discuss the tradeoff). Changed `goclang++.bat`: `USE_SHIM`/
+`USE_ABAC` now default to `1`; `--shim-sandbox` still exists but now
+only changes *how strictly* a missing/unbuilt shim_sandbox is treated --
+by default it's a silent fallback to a bridge-less build (identical to
+today's `wasigoc`-only behavior), `--shim-sandbox` (or any future CI
+invocation wanting a hard failure instead of a silent downgrade) makes
+it `exit /b 1` the same way it always has. Added `--no-shim-sandbox`
+(skip the bridge entirely) and `--no-abac` (bridge, no
+`-DW2G_ABAC_SYSTEM=1`). Updated `docs/build.md` and `README.md` to
+match. **Not verified by actually running the `.bat`** (`.bat` files
+still can't execute through this session's tools, see the standing
+gotcha above) -- the new branches were written to the same
+`EnableDelayedExpansion`/`!VAR!`-inside-blocks discipline as the rest of
+the file (including the exact bug class a previous round of this diary
+already found and fixed in this same script), but ask the user to
+smoke-test `goclang++.bat` themselves before relying on it.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
@@ -1121,7 +1534,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `crypto/sha3` | **in** (SHA3-256 only, FIPS 202 Keccak sponge, domain 0x06. Verified against the empty-string and "abc" FIPS 202 vectors) |
 | `crypto/hkdf` | **in** (HKDF-SHA256 Extract/Expand/Sum, RFC 5869 case 1 vector) |
 | `crypto/pbkdf2` | **in** (PBKDF2-HMAC-SHA256, RFC 8018 / well-known password/salt/c=1 and c=2 vectors) |
-| `crypto/tls` | **in** (stub -- Dial/Handshake/LoadX509KeyPair return "not supported"; needs sockets plus x509 chain verification, same terminal shape as os/exec) |
+| `crypto/tls` | **in** (`Dial`/`Read`/`Write`/`Close` are real via `gocvm.Call("tls.dial"/"tls.io.*", ...)` on a `goclang++.bat --shim-sandbox` build -- a genuine Schannel/SSPI handshake with automatic certificate + hostname validation, see the GocVM diary entry above; `Dial` does connect+handshake in one call, so `Handshake()` is a no-op once it succeeds. Plain wasm32-wasip1 falls back to the same "not supported" error as before. `LoadX509KeyPair` (client certs) stays stubbed -- out of scope) |
 | `crypto/x509` | **in** (bounded DER header reader: ParseCertificate pulls the serial INTEGER out of TBSCertificate. No signature check, no chain Verify) |
 | `crypto/x509/pkix` | **in** (Name + String = CommonName) |
 | `crypto/rsa` | **in** (bounded: raw textbook modular exponentiation only -- `EncryptRaw`/`DecryptRaw` compute `m^E mod N`/`c^D mod N` via `math/big.Int.Exp` -- NOT real Go's actual API (`EncryptPKCS1v15`/`GenerateKey`/etc. don't exist here). No padding scheme (textbook RSA alone is deterministic/malleable, same "present for legacy/textbook interop only, not hardened" framing as `crypto/rc4`/`crypto/des`), and no `GenerateKey` (needs a modular inverse to derive D from E, which `math/big` doesn't have -- a `PrivateKey` must be built from an externally supplied N/E/D). **Verified against real Go itself** (go1.26.4, installed locally): both the classic textbook example (n=3233, e=17, d=2753, m=65 -> c=2790) and a second independently-chosen vector (n=589, e=7, d=463, m=123 -> c=61) were computed with real Go's own `math/big.Int.Exp` first, then reproduced exactly by this port. Found and fixed a real, general, previously-latent compiler bug while writing this package -- the first stdlib source in this project to initialize an embedded struct field by name in a composite literal (`PrivateKey{PublicKey: *pub, D: ...}`): `EmitCompositeLit`/`EmitCompositeLitPtr` (`src/cpp_generator.cc`) generated `__s.PublicKey = ...`/`__p->PublicKey = ...` for EVERY keyed/positional field including embedded ones, but an embedded field is emitted as a C++ base-class subobject, not a named member (`struct PrivateKey : public PublicKey {...}` -- see `EmitStructDefs`), so `PublicKey` there resolved to the base class's own injected-class-name instead of anything assignable, failing to compile. Fixed by special-casing an embedded field in all four composite-literal code paths (keyed/positional × value/pointer) to assign through the base subobject directly (`static_cast<Base&>(__s) = ...`), the same shape the struct's own generated `operator==` already used for embedded-field comparison; also had to resolve the embedded field's OWN package correctly (an unqualified embedded-field type name means a type in the STRUCT's declaring package, not the package of the file currently being generated -- `QualName`'s pkg-empty case defaults to the latter) |
@@ -1190,7 +1603,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `index/suffixarray` | **in** (bounded: `New`/`Lookup`/`Bytes` only, no `Read`/`Write` persistence -- there's no `gob` here to persist through anyway. Built with `sort.Slice` over suffix start indices (O(n log^2 n) comparison sort) rather than real Go's linear-time DC3/skew construction; `Lookup` itself is the same binary-search-over-sorted-suffixes cost as real Go) |
 | `io` | **in** (partial) |
 | `io/ioutil` | **in** (deprecated in real Go too -- `ReadAll`/`ReadFile`/`WriteFile` as direct pass-throughs to `io`/`os`. Not implemented: `ReadDir`/`TempFile`/`TempDir` (no directories or temp-file support in this project's `os`), `NopCloser` (needs `io.ReadCloser`, not added yet)) |
-| `io/fs` | **in** (bounded: `FS`/`File`/`FileInfo` interfaces, `ValidPath`, generic `ReadFile`/`Stat` helpers operating on any caller-provided `FS` -- no os-backed FS at all, since this project's `os` has no directory listing to back one with (same gap `os` itself already documents); no `ReadDir`/`Glob`/`WalkDir`/`Sub`, which would need a directory-bearing FS to exercise against. `FileMode` is a plain `uint32` (matching real Go's own underlying type) with no methods, same struct-receiver-only bound as `time.Duration` -- `IsDir` lives on `FileInfo` instead, matching real Go's own shape. Verified with an in-memory map-backed `FS` implementation: `ReadFile`/`Stat` through the interface, a not-found path, and `ValidPath` against 7 cases including the "." special case, leading/trailing slash, doubled slash, and a ".." element) |
+| `io/fs` | **in** (bounded: `FS`/`File`/`FileInfo` interfaces, `ValidPath`, generic `ReadFile`/`Stat` helpers operating on any caller-provided `FS` -- still no os-backed FS (an `os.DirFS`-equivalent wrapping `os.Stat`/`os.ReadDir`, which now exist -- see `os`'s own tracker line -- has not been built); no `ReadDir`/`Glob`/`WalkDir`/`Sub`, which would need a directory-bearing FS to exercise against (`path/filepath`'s own `WalkDir` -- see its tracker line -- is a separate, `os`-only implementation, not built on `io/fs.FS`). `FileMode` is a plain `uint32` (matching real Go's own underlying type) with no methods, same struct-receiver-only bound as `time.Duration` -- `IsDir` lives on `FileInfo` instead, matching real Go's own shape. Verified with an in-memory map-backed `FS` implementation: `ReadFile`/`Stat` through the interface, a not-found path, and `ValidPath` against 7 cases including the "." special case, leading/trailing slash, doubled slash, and a ".." element) |
 | `log` | **in** (Print/Println/Fatal/Fatalln/Panic/Panicln only -- no `*f`, see stdlib/log) |
 | `log/slog` | **in** (bounded: a single concrete text-format `Logger`, no pluggable `Handler` interface, no `Group`/`LogAttrs`. `Level`/`LevelDebug`..`LevelError`, `LevelString` -- not a `Level.String()` method, same struct-receiver-only limitation as `time.Duration` -- `New`/`SetLevel`/`Debug`/`Info`/`Warn`/`Error`, package-level default-logger functions + `SetDefault`) |
 | `log/syslog` | n/a |
@@ -1204,17 +1617,17 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `mime` | **in** (`TypeByExtension`/`AddExtensionType` only -- no `ParseMediaType`/`FormatMediaType`, no `/etc/mime.types`. Seeded with real Go's own built-in default table, a faithful subset not invented values) |
 | `mime/multipart` | **in** (bounded: `Writer.WriteField`/`WriteFile` take the whole value/data at once, not real Go's `CreateFormField`/`CreateFormFile` shape (which return an `io.Writer` to stream into); self-generated boundary built from `math/rand`, not cryptographically random. `Reader` parses the whole body up front at `NewReader` time (via `io.ReadAll`), same bounded shape as `encoding/csv`'s `Reader`; `Part.Header` is parsed directly (one header per line, no RFC 822 continuation folding) rather than routed through `net/textproto.Reader`. Verified round-tripping a `WriteField` + a `WriteFile` through `Writer`/`Close` and back through `Reader.NextPart`/`FormName`/`FileName`/`Read`, plus the end-of-parts `io.EOF` signal) |
 | `mime/quotedprintable` | **in** (bounded: `Writer` streams real encoding with 76-column soft line breaks and correct trailing-whitespace escaping, but always normalizes a bare `\n` to canonical `\r\n` (unlike Python's `quopri`, which leaves it alone) -- a deliberate Rosetta-not-parity choice, not a bug. `Reader` is bounded like `encoding/csv`'s -- decodes the whole input up front via `io.ReadAll` at `NewReader` time rather than truly streaming. Decode logic (soft-break and `=XX` handling) cross-checked against Python's `quopri.decodestring`. Found and fixed a real, general compiler bug building it: a `[]byte{...}` composite literal with an element that indexes a `string` constant (`hexDigits[b>>4]`) emitted the C++ `operator[]` result -- `char` -- uncast into a `wasigo::Slice<uint8_t>` brace-init list; Go's own type system already says string-indexing yields `byte`, but the C++ side didn't match it, and clang (not MSVC, which only warned) rejects that as a narrowing-conversion error. Fixed in `EmitIndex` by casting a string index to `uint8_t` at the point of indexing) |
-| `net` | **in** (`Dial`/`Listen`/`Listener` and a `Conn` built via them all return a clear "not supported" error -- WASI preview 1 has no socket syscalls at all on this target, verified directly in wasi-libc's own header, not a todo. `Pipe()` DOES work for real, though: an in-memory, synchronous, full-duplex `Conn` pair needing no sockets at all -- same idea real Go's own `net.Pipe` uses, just channel-backed here instead of mutex/cond-backed -- see the "Where we are" writeup) |
+| `net` | **in** (`Dial`/`Listen`/`Listener.Accept`/`Conn.Read`/`Write`/`Close` and `ListenPacket`/`DialPacket`/`PacketConn.ReadFrom`/`WriteTo` are all real via `gocvm.Call("net.*", ...)` on a `goclang++.bat --shim-sandbox` build -- real Winsock sockets that actually move bytes (a handle table on the shim_sandbox side, not just a reachability probe), see the GocVM diary entry above. Plain wasm32-wasip1 still has no socket syscalls at all on this target (verified directly in wasi-libc's own header, not a todo) and falls back unchanged to the original local-loopback-only stack. `Pipe()` DOES work for real on both builds, though: an in-memory, synchronous, full-duplex `Conn` pair needing no sockets at all -- same idea real Go's own `net.Pipe` uses, just channel-backed here instead of mutex/cond-backed -- see the "Where we are" writeup) |
 | `net/http` `net/http/cgi` `net/http/cookiejar` `net/http/fcgi` `net/http/httptest` `net/http/httptrace` `net/http/httputil` `net/http/pprof` `net/netip` `net/rpc` `net/rpc/jsonrpc` `net/smtp` | n/a (needs real sockets, which `net` above confirms don't exist for this target -- not attempted) |
 | `net/mail` | **in** (partial -- `ParseAddress`/`ParseAddressList` for `"Name <addr@host>"`/bare `addr@host`, comma-separated lists; no RFC 5322 date/message parsing, no `ReadMessage`) |
 | `net/textproto` | **in** (partial -- pure string/header handling, no `Conn`/`Pipeline`: `CanonicalMIMEHeaderKey`, `MIMEHeader` + free `Header{Get,Set,Add,Del,Values}` functions since methods need a struct receiver, `Reader.ReadLine`/`ReadMIMEHeader` with continuation-line folding) |
 | `net/url` | **in** (`QueryEscape`/`QueryUnescape`/`PathEscape`/`PathUnescape`, `URL` struct + `Parse`/`String`, `ParseQuery` -- no userinfo/port split, `ParseQuery` returns a flat `map[string]string` not real Go's multi-value `Values`) |
-| `os` | **in** (builtin: Args/Exit/Getenv/File/Stdout/Stdin/Stderr) + **rt** (dirs/process still todo) |
-| `os/exec` | **in** (stub -- `Cmd`/`Command`/`Run`/`Start`/`Wait`/`Output`/`CombinedOutput`/`LookPath` all return a clear "not supported" error; WASI preview1 has no subprocess support, so this is the correct terminal shape, not a placeholder for later) |
-| `os/user` | **in** (deliberate stub, same shape as `os/exec` -- WASI preview1 has no user database at all, `Current`/`Lookup`/`LookupId` all return a clear "not supported" error) |
+| `os` | **in** (builtin: Args/Exit/Getenv/File/Stdout/Stdin/Stderr, `Stat`/`FileInfo`, `ReadDir`/`DirEntry` -- real directory listing via `<dirent.h>` opendir/readdir/closedir, genuine WASI `fd_readdir`, not a stub) + **rt** (Setenv/process still todo) |
+| `os/exec` | **in** (`Run`/`Output`/`CombinedOutput`/`Start`/`Wait` are all real via `gocvm.Call("os.exec"/"os.exec.start"/"wait"/"stdout.read", ...)` on a `goclang++.bat --shim-sandbox` build (real `CreateProcess`; `Start`+`Wait` stream real output into `Cmd.Stdout`/`Stderr` via a pump goroutine, see the GocVM diary entry above); plain wasm32-wasip1 still has no subprocess support, so those fall back to the same clear "not supported" error as before. `LookPath` stays stubbed -- no PATH-search topic exists yet; `Cmd.Stdin` is always wired to `NUL` (no interactive input) and stdout/stderr can't be separated (the real backend combines them into one pipe) |
+| `os/user` | **in** (`Current`/`Lookup`/`LookupId` are all real via `gocvm.Call("os.user", ...)` on a `goclang++.bat --shim-sandbox` build (real `GetUserNameW`/`LookupAccountNameW`/`LookupAccountSidW`+`NetUserGetInfo`, see the GocVM diary entry above); plain wasm32-wasip1 falls back to the same "not supported" error as before) |
 | `os/signal` | **in** (deliberate no-op, same honest-boundary shape as `os/exec`/`runtime` -- WASI preview1 delivers no signals to a wasm guest at all. `Notify`/`Stop`/`Ignore`/`Reset`; signals are a plain `int` (POSIX-numbered), not real Go's `os.Signal` interface, since `os` is a compiler builtin here. Found and fixed one more general compiler bug building this: `package signal` collided with the C standard library's global `signal()` -- same class of fix already applied to `log`/`rand`, extended to cover this name too) |
 | `path` | **in** (partial) |
-| `path/filepath` | **in** (partial, slash-only) |
+| `path/filepath` | **in** (partial, slash-only; now includes `Rel` and `WalkDir`/`SkipDir` built on `os.ReadDir` -- no `Abs`, no `os.Getwd` to build it from) |
 | `plugin` | n/a |
 | `reflect` | **in** (partial, read-only -- `TypeOf`/`ValueOf`, `Value`/`Type` with `Kind`/`Name`/`NumField`/`Field`/`FieldName`/`Interface`/`Int`/`Float`/`Bool`/`String`; no `Set*`/addressable values, no Slice/Map/Chan/Func Kind classification, `int`/`int64` and other same-width Go type pairs share one Kind since they're the same C++ type here -- see the compiler-bugs writeup) |
 | `regexp` | **in** (real backtracking engine, not a stub -- literals/`.`/`*`/`+`/`?` greedy/char classes with ranges and `\d\D\w\W\s\S`/`^$` anchors/`\|` alternation/`(...)` grouping; no capture groups, no `{m,n}`, no non-greedy, no lookaround; `Compile`/`MustCompile`/`Match`/`MatchString`/`FindString`/`FindStringIndex`/`FindAllString`/`ReplaceAllString`/`Split`) |
@@ -1232,7 +1645,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `strings` | **in** (partial) |
 | `sync` | **in** (`Mutex`/`RWMutex` no-op, `Once`/`WaitGroup` counter-tracked -- see stdlib/sync; no `Map`, needs `any` equality this compiler doesn't have) |
 | `sync/atomic` | **in** (legacy function-based API + the Go 1.19+ `Int32`/`Int64`/`Uint32`/`Uint64`/`Bool`/`Value` types; one thread, so every op is a plain load/store/compare) |
-| `syscall` | **in** (stub -- see its own tracker line above; Getpid/Getwd exist, mutating syscalls return "not supported") |
+| `syscall` | **in** (see its own tracker line below; Getpid/Getppid/Getenv/Environ/Chdir/Kill real via `gocvm.Call` on a `goclang++.bat --shim-sandbox` build) |
 | `testing` | **in** (bounded, deliberately not real Go's `go test` machinery -- this compiler has no build-time scanning to discover `func TestXxx(t *testing.T)` functions in a package, so a program using this package must call its own test functions itself; `Run(name, fn)` is a small helper that does that and prints a `--- PASS`/`--- FAIL` line like `go test -v`. No `Errorf`/`Fatalf`/`Logf` -- same documented wall as `log`'s own package comment: `fmt.Sprintf`'s format string must be a literal at the call site, so a Printf-shaped wrapper taking a `format string` parameter can never work here; `Error`/`Fatal`/`Log` take `...any` and space-join instead, matching `log.Print`'s own bound. `FailNow`/`Fatal` don't actually unwind the test function early (no real stack unwinding here at all, already documented elsewhere) -- just set the failed flag, a stated behavior difference. Verified with a passing and a deliberately failing test, checking `Run`'s own returned bool matches printed PASS/FAIL) |
 | `testing/iotest` | **in** (partial: `OneByteReader`/`HalfReader`/`ErrReader`/`DataErrReader`. `DataErrReader` reads the wrapped Reader to completion up front (this project's "buffer, don't stream" precedent) and always attaches `io.EOF` specifically as the terminal error rather than preserving the wrapped Reader's own real error like real Go does -- a stated narrowing, not an oversight, since EOF is what this helper is actually for in practice. NOT implemented: `TimeoutReader` (no real deadline concept here), `TestReader` (a fuller conformance checker). Verified the specific behavior each wrapper exists to exercise: `OneByteReader` returns exactly 1 byte from a 10-byte buffer, `HalfReader` returns exactly half a requested 8-byte read, `ErrReader` returns the exact wrapped error, and `DataErrReader` on a single-byte source returns `(1, io.EOF)` from the SAME call -- the specific shape the real helper is meant to catch a caller mishandling) |
 | `testing/fstest` | **in** (bounded: `TestFS` only, and much narrower than real Go's actual version, which walks the whole tree via `ReadDir` and cross-checks structure -- this project's `io/fs` has no `ReadDir` at all (no os-backed FS ever will either), so this bounded version only confirms every path in the expected list actually opens and reads via `fs.ReadFile`. Verified against an in-memory `FS`: a fully-satisfiable expected list returns nil, one including a missing path returns a non-nil error) |
@@ -1249,7 +1662,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `unicode/utf16` | **in** |
 | `unicode/utf8` | **in** (partial) |
 | `unsafe` | **in** (tiny: Pointer is uint64 -- this compiler has no uintptr builtin -- Add/PointerFromInt/IntFromPointer. No Sizeof/Alignof/Offsetof -- those are compiler builtins) |
-| `syscall` | **in** (stub -- Getpid=1, Getwd=".", Chdir/Kill return "not supported"; use WASI / Wasi2G++ shim, not Linux syscalls) |
+| `syscall` | **in** (Getpid/Getppid/Getenv/Environ/Chdir/Kill real via `gocvm.Call` on a `goclang++.bat --shim-sandbox` build (real Win32 process/env/directory/termination calls, see the GocVM diary entry above); Getwd="." always (no real Getwd topic); plain wasm32-wasip1 falls back to the same canned values/errors as before) |
 
 ## Build
 

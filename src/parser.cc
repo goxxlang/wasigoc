@@ -424,6 +424,39 @@ class ParserImpl {
     return ParsePostfix();
   }
 
+  // `Name[T]{...}` / `pkg.Name[T, U]{...}` -- a generic type instantiated
+  // directly in expression position as a composite literal -- parses its
+  // `[...]` exactly like an index/slice expression would (ParsePostfix
+  // has already committed to that path before the trailing `{` is ever
+  // seen), so the type argument(s) arrive here as ordinary Exprs. Only
+  // the shapes a type argument can actually take are accepted; anything
+  // else means this wasn't a type instantiation after all, and the
+  // caller had no business getting this far.
+  std::unique_ptr<TypeNode> TypeArgExprToType(const Expr& e) {
+    if (e.kind == ExprKind::Ident) return MakeNamedType(e.strval);
+    if (e.kind == ExprKind::Selector && e.x && e.x->kind == ExprKind::Ident) {
+      return MakeNamedType(e.strval, e.x->strval);
+    }
+    if (e.kind == ExprKind::Unary && e.strval == "*" && e.x) {
+      auto t = std::make_unique<TypeNode>();
+      t->kind = TypeKind::Pointer;
+      t->elem = TypeArgExprToType(*e.x);
+      return t;
+    }
+    Fail("expected a type argument");
+    return nullptr;
+  }
+
+  // The base of a `Name[...]{...}` / `pkg.Name[...]{...}` generic
+  // instantiation, read back from the Ident/Selector ParsePostfix already
+  // parsed it as before the `[` was seen.
+  std::unique_ptr<TypeNode> NamedTypeFromBaseExpr(const Expr& e) {
+    if (e.kind == ExprKind::Selector && e.x && e.x->kind == ExprKind::Ident) {
+      return MakeNamedType(e.strval, e.x->strval);
+    }
+    return MakeNamedType(e.strval);
+  }
+
   std::unique_ptr<Expr> ParsePostfix() {
     auto e = ParsePrimary();
     for (;;) {
@@ -491,12 +524,45 @@ class ParserImpl {
             }
             Expect(TokKind::RBracket);
             e = std::move(sl);
-          } else {
-            auto idx = MakeLit(ExprKind::Index, *e);
-            idx->x = std::move(e);
-            idx->y = std::move(first);
+          } else if (Check(TokKind::Comma)) {
+            // A comma-separated list inside `[...]` is never valid Go
+            // indexing syntax -- only a generic type instantiation with
+            // 2+ type arguments looks like this (`Map2[string, int]{...}`).
+            std::vector<std::unique_ptr<TypeNode>> type_args;
+            type_args.push_back(TypeArgExprToType(*first));
+            while (Accept(TokKind::Comma)) {
+              if (Check(TokKind::RBracket)) break;
+              auto arg = ParseExpr();
+              type_args.push_back(TypeArgExprToType(*arg));
+            }
             Expect(TokKind::RBracket);
-            e = std::move(idx);
+            auto named = NamedTypeFromBaseExpr(*e);
+            named->type_args = std::move(type_args);
+            if (allow_composite_lit_ && Accept(TokKind::LBrace)) {
+              e = ParseCompositeLitBody(std::move(named));
+            } else {
+              auto ce = MakeLit(ExprKind::CompositeLit, *e);
+              ce->type = std::move(named);
+              e = std::move(ce);
+            }
+          } else {
+            Expect(TokKind::RBracket);
+            if (allow_composite_lit_ && Check(TokKind::LBrace) &&
+                (e->kind == ExprKind::Ident || e->kind == ExprKind::Selector)) {
+              // `Name[T]{...}` -- a single-type-argument generic
+              // instantiation composite literal, not indexing (an
+              // ordinary index expression is never directly followed by
+              // an unparenthesized '{' in valid Go).
+              Advance();
+              auto named = NamedTypeFromBaseExpr(*e);
+              named->type_args.push_back(TypeArgExprToType(*first));
+              e = ParseCompositeLitBody(std::move(named));
+            } else {
+              auto idx = MakeLit(ExprKind::Index, *e);
+              idx->x = std::move(e);
+              idx->y = std::move(first);
+              e = std::move(idx);
+            }
           }
         }
       } else {
@@ -1357,9 +1423,9 @@ class ParserImpl {
     Expect(TokKind::LBrace);
     SkipSemis();
     while (!Check(TokKind::RBrace)) {
-      FieldDecl fd;
       if (Check(TokKind::Star) || Check(TokKind::KwMap) || Check(TokKind::KwChan) ||
           Check(TokKind::LBracket) || Check(TokKind::KwFunc)) {
+        FieldDecl fd;
         fd.embedded = true;
         fd.type = ParseType();
         if (fd.type->kind == TypeKind::Named) fd.name = fd.type->name;
@@ -1367,22 +1433,45 @@ class ParserImpl {
                  fd.type->elem->kind == TypeKind::Named) {
           fd.name = fd.type->elem->name;
         }
-      } else {
-        std::string name = ExpectIdent();
-        if (Check(TokKind::Semi) || Check(TokKind::RBrace)) {
-          fd.embedded = true;
-          fd.name = name;
-          fd.type = MakeNamedType(name);
-        } else {
-          fd.name = name;
-          fd.type = ParseType();
+        if (Check(TokKind::StringLit)) {
+          fd.tag = Cur().text;
+          Advance();
         }
+        sd.fields.push_back(std::move(fd));
+        SkipSemis();
+        continue;
       }
+      std::string name = ExpectIdent();
+      if (Check(TokKind::Semi) || Check(TokKind::RBrace)) {
+        FieldDecl fd;
+        fd.embedded = true;
+        fd.name = name;
+        fd.type = MakeNamedType(name);
+        sd.fields.push_back(std::move(fd));
+        SkipSemis();
+        continue;
+      }
+      // Grouped field names sharing one type -- Go's ordinary
+      // `A, B, C Type` shorthand (unlike a single embedded field name,
+      // which is never followed by a comma). Falls through the same
+      // path when there's only one name.
+      std::vector<std::string> names{name};
+      while (Accept(TokKind::Comma)) {
+        names.push_back(ExpectIdent());
+      }
+      auto type = ParseType();
+      std::string tag;
       if (Check(TokKind::StringLit)) {
-        fd.tag = Cur().text;
+        tag = Cur().text;
         Advance();
       }
-      sd.fields.push_back(std::move(fd));
+      for (auto& n : names) {
+        FieldDecl fd;
+        fd.name = n;
+        fd.type = CloneType(type.get());
+        fd.tag = tag;
+        sd.fields.push_back(std::move(fd));
+      }
       SkipSemis();
     }
     Expect(TokKind::RBrace);
@@ -1525,10 +1614,31 @@ class ParserImpl {
     ParseOneTypeSpec(f);
   }
 
+  // A `[` right after a type name is ambiguous with Go's own grammar:
+  // `type Name[T any] struct{...}` (generic type params) vs.
+  // `type Name [N]T` (a named array type, N a literal or a named
+  // constant) vs. `type Name []T` (a named slice type). Real Go
+  // disambiguates the same way: an empty `[]`, or a `[` followed by
+  // something that isn't a single identifier immediately followed by
+  // `]`, is never a type-param list -- type params always need at
+  // least one identifier name AND a constraint after it.
+  bool LooksLikeTypeParamList() const {
+    if (!Check(TokKind::LBracket)) return false;
+    size_t i = pos_ + 1;
+    if (i >= toks_.size() || toks_[i].kind == TokKind::RBracket) return false;
+    if (toks_[i].kind != TokKind::Ident) return false;
+    size_t j = i + 1;
+    if (j >= toks_.size() || toks_[j].kind == TokKind::RBracket) return false;
+    return true;
+  }
+
   void ParseOneTypeSpec(File& f) {
     std::string name = ExpectIdent();
     std::vector<std::string> tparams;
-    if (Accept(TokKind::LBracket)) ParseTypeParamNames(tparams);
+    if (LooksLikeTypeParamList()) {
+      Advance();  // consume '['
+      ParseTypeParamNames(tparams);
+    }
     if (Check(TokKind::KwStruct)) {
       StructDecl sd;
       sd.name = std::move(name);

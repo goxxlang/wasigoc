@@ -72,6 +72,148 @@ __wasigo_end:;
   assert(order == "R01");
 }
 
+// -- gocvm::Call's ErrorState state machine (kClear/kBridgeActive/kPanic) --
+// No compiled Go++ source exercises the "no bridge"/"bridge panic"/
+// "reentrant" branches (compile.bat links no bridge at all, and the real
+// shim_sandbox bridge never panics in practice), so this drives
+// gocvm::Call and its HostBridge/AbacHook contract directly.
+
+struct OkBridge : gocvm::HostBridge {
+  bool Call(const std::string&, const std::string& payload,
+            std::string* reply_out, std::string*) override {
+    *reply_out = payload + "!";
+    return true;
+  }
+};
+
+struct FailBridge : gocvm::HostBridge {
+  bool Call(const std::string&, const std::string&, std::string*,
+            std::string* err_out) override {
+    *err_out = "connect refused";
+    return false;
+  }
+};
+
+// Simulates a runtime panic surfacing from generated Go++ code the bridge
+// calls into (bounds check, nil deref, ...): a PanicFrame with a pending
+// panic, unwound via its destructor exactly like compiler-emitted
+// `goto __wasigo_end` does. Per the ErrorState contract documented on
+// HostBridge::Call, the bridge must check bridge_panicked() and return
+// false rather than continuing.
+struct PanicBridge : gocvm::HostBridge {
+  bool Call(const std::string&, const std::string&, std::string* reply_out,
+            std::string*) override {
+    {
+      PanicFrame pf;
+      pf.has_pending = true;
+      pf.pending = "boom from bridge";
+    }
+    if (g_error_state().bridge_panicked()) return false;
+    *reply_out = "should not reach";
+    return true;
+  }
+};
+
+// A bridge that itself makes a nested gocvm::Call — not something any real
+// bridge does today, but enter_bridge()'s reentrancy guard exists
+// specifically to diagnose this instead of corrupting g_error_state, so
+// it needs its own coverage.
+struct ReentrantBridge : gocvm::HostBridge {
+  bool Call(const std::string&, const std::string&, std::string* reply_out,
+            std::string*) override {
+    auto inner = gocvm::Call("reentrant.topic", "x");
+    assert(inner.r1 != nullptr);
+    *reply_out = inner.r1.str();
+    return true;
+  }
+};
+
+struct DenyAbac : gocvm::AbacHook {
+  bool Check(const std::string& topic) override { return topic != "denied.topic"; }
+};
+
+static void gocvm_error_state() {
+  // kClear, no bridge registered at all: distinguishable from a real
+  // bridge's own failure by err_out never being set.
+  {
+    auto r = gocvm::Call("some.topic", "x");
+    assert(r.r0.empty());
+    assert(r.r1 != nullptr);
+    assert(r.r1.str().find("no host bridge registered") != std::string::npos);
+    assert(g_error_state().is_clear());
+  }
+
+  // kClear -> kBridgeActive -> kClear (success path).
+  OkBridge ok;
+  gocvm::RegisterHostBridge(&ok);
+  {
+    auto r = gocvm::Call("echo", "hi");
+    assert(r.r1 == nullptr);
+    assert(r.r0 == "hi!");
+    assert(g_error_state().is_clear());
+  }
+
+  // A real bridge failure (ok=false) is a normal error, not a panic.
+  FailBridge fail;
+  gocvm::RegisterHostBridge(&fail);
+  {
+    auto r = gocvm::Call("net.dial", "x");
+    assert(r.r1 != nullptr);
+    assert(r.r1.str().find("connect refused") != std::string::npos);
+    assert(r.r1.str().find("bridge panic") == std::string::npos);
+    assert(g_error_state().is_clear());
+  }
+
+  // kBridgeActive -> kPanic -> kClear: a panic inside the bridge must
+  // surface as a wasigo::Error, never abort the process.
+  PanicBridge panic_bridge;
+  gocvm::RegisterHostBridge(&panic_bridge);
+  {
+    auto r = gocvm::Call("os.exec", "x");
+    assert(r.r1 != nullptr);
+    assert(r.r1.str().find("bridge panic: boom from bridge") != std::string::npos);
+    assert(g_error_state().is_clear());  // consume_panic() reset it
+  }
+  // ErrorState must be usable again immediately after a stashed panic.
+  gocvm::RegisterHostBridge(&ok);
+  {
+    auto r = gocvm::Call("echo", "still works");
+    assert(r.r1 == nullptr);
+    assert(r.r0 == "still works!");
+  }
+
+  // Reentrant gocvm::Call is diagnosed, not UB, and leaves ErrorState
+  // clean for the next (non-reentrant) call.
+  ReentrantBridge reentrant;
+  gocvm::RegisterHostBridge(&reentrant);
+  {
+    auto r = gocvm::Call("outer.topic", "x");
+    assert(r.r1 == nullptr);  // outer bridge itself returned true
+    assert(r.r0.find("reentrant bridge call") != std::string::npos);
+    assert(g_error_state().is_clear());
+  }
+  gocvm::RegisterHostBridge(&ok);
+  {
+    auto r = gocvm::Call("echo", "post-reentrant");
+    assert(r.r1 == nullptr);
+    assert(r.r0 == "post-reentrant!");
+  }
+
+  // ABAC deny short-circuits before the bridge is ever entered.
+  DenyAbac deny;
+  gocvm::RegisterAbacHook(&deny);
+  {
+    auto denied = gocvm::Call("denied.topic", "x");
+    assert(denied.r1 != nullptr);
+    assert(denied.r1.str().find("abac deny") != std::string::npos);
+    auto allowed = gocvm::Call("allowed.topic", "y");
+    assert(allowed.r1 == nullptr);
+    assert(allowed.r0 == "y!");
+  }
+  gocvm::RegisterAbacHook(nullptr);
+  gocvm::RegisterHostBridge(nullptr);
+}
+
 int main() {
   auto s = Slice<int64_t>{1, 2, 3};
   assert(len(s) == 3);
@@ -165,5 +307,7 @@ int main() {
   run(select_default());
   run(buffered());
   run(returning_task());
+
+  gocvm_error_state();
   return 0;
 }

@@ -36,7 +36,10 @@
 //     stack (WASM has no escape analysis).
 //   - Cooperative scheduling: no data races, no atomics, no wasi-threads.
 //   - user panic is a goto to the function epilogue (noeh has no throw/setjmp);
-//     defer still runs via DeferList; runtime panics abort.
+//     defer still runs via DeferList; runtime panics abort outside a bridge.
+//   - ErrorState state machine: the single SFI error boundary at gocvm::Call.
+//     Inside a bridge dispatch, panic() stashes instead of aborting — no C++
+//     exceptions, no setjmp, works identically on noeh and native builds.
 //   - send/recv on a nil channel panics rather than blocking forever -- a
 //     forever-block is a Go footgun with no good C++ spelling on a target
 //     that cannot be preempted.
@@ -55,12 +58,15 @@
 // iostream must come before the C stdio headers: wasi-sdk's noeh libc++
 // blows up if <cstdio>/<cstdlib> have already defined ctype bits.
 #include <iostream>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -144,13 +150,167 @@ inline std::ostream& operator<<(std::ostream& o, Complex128 z) {
   return o;
 }
 
+// ---- ErrorState (SFI error state machine) -----------------------------------
+// ALL error handling in the wasigo runtime — panic, recover, and gocvm
+// bridge faults — flows through a single thread-local state machine.
+// No C++ exceptions, no setjmp/longjmp.  Works identically on native
+// and wasm32-wasip1/noeh builds.
+//
+// States:
+//   kClear        — normal execution.  panic() aborts (runtime fault).
+//   kBridgeActive — inside a gocvm::Call dispatch.  panic() transitions
+//                   to kPanic instead of aborting, so the bridge call
+//                   returns an error to generated Go++ code.
+//   kPanic        — a panic fired inside a bridge call.  The bridge
+//                   must check and return early; gocvm::Call surfaces
+//                   the stashed message as wasigo::Error.
+//   kRecovered    — a user recover() consumed the pending panic.
+//
+// The state machine is the single SFI error boundary: generated Go++
+// code never uses try/catch/throw, and gocvm::Call is the only place
+// where a runtime fault can be caught and turned into a value.
+//
+// User-level panic in a function that has defer is still the
+// compiler-emitted `__pf.has_pending = true; goto __wasigo_end;`
+// pattern — PanicFrame is unchanged for that path.  ErrorState only
+// activates at the gocvm boundary.
+
+enum class ErrorStateKind {
+  kClear,
+  kBridgeActive,
+  kPanic,
+  kRecovered,
+};
+
+struct ErrorState {
+  ErrorStateKind kind = ErrorStateKind::kClear;
+
+  // Panic message stash.  Pre-reserved to kStashReserve bytes so that an
+  // OOM-triggered panic can land without a secondary allocation.  The
+  // reserve is established once on first enter_bridge() (not at static
+  // init, since thread_local constructors run before main on some
+  // toolchains and wasm runtimes).
+  static constexpr std::size_t kStashReserve = 256;
+  std::string panic_msg;
+
+  bool is_clear()        const { return kind == ErrorStateKind::kClear; }
+  bool is_bridge()       const { return kind == ErrorStateKind::kBridgeActive; }
+  bool is_panic()        const { return kind == ErrorStateKind::kPanic; }
+  bool is_recovered()    const { return kind == ErrorStateKind::kRecovered; }
+
+  // Enter bridge dispatch.  Returns false if already inside a bridge
+  // (reentrant gocvm.Call — not expected, but diagnosed rather than UB).
+  //
+  // Reentrancy note: shim_sandbox bridge calls are strictly synchronous
+  // (run-to-completion, no co_await, no callback into Go++ user code),
+  // so a flat flag is sufficient.  If a future bridge needs to call back
+  // into generated code, this must become a depth-counted stack — but
+  // that would also require re-entering the cooperative runqueue, which
+  // is a much larger design change.  For now, reentrant calls are
+  // diagnosed and rejected.
+  bool enter_bridge() {
+    if (kind != ErrorStateKind::kClear) return false;
+    kind = ErrorStateKind::kBridgeActive;
+    if (panic_msg.capacity() < kStashReserve) {
+      panic_msg.reserve(kStashReserve);
+    }
+    panic_msg.clear();
+    return true;
+  }
+
+  // Called by panic() when kBridgeActive: stash message, transition to
+  // kPanic.  The bridge implementation must check bridge_panicked() and
+  // return early.
+  //
+  // Allocation safety: panic_msg was pre-reserved in enter_bridge().
+  // If msg is longer than the reserve, the std::string move is a pointer
+  // swap (no allocation).  If msg is short, it fits in the reserved
+  // buffer.  A truly catastrophic OOM that prevents even a move is not
+  // recoverable on any target.
+  void bridge_panic(std::string msg) {
+    kind = ErrorStateKind::kPanic;
+    panic_msg = std::move(msg);
+  }
+
+  // Check whether a panic is pending (for bridge code to early-return).
+  bool bridge_panicked() const { return kind == ErrorStateKind::kPanic; }
+
+  // Consume the pending panic as a wasigo::Error and reset to kClear.
+  // Called by gocvm::Call after the bridge returns.
+  std::string consume_panic() {
+    std::string msg = std::move(panic_msg);
+    kind = ErrorStateKind::kClear;
+    return msg;
+  }
+
+  // Leave bridge dispatch (success path).  Resets to kClear.
+  void leave_bridge() {
+    kind = ErrorStateKind::kClear;
+    panic_msg.clear();
+  }
+};
+
+// A plain `inline thread_local ErrorState g_error_state;` (C++17 inline
+// variable) triggers "multiple definition of TLS init function for
+// wasigo::g_error_state" at link time on this toolchain (WinLibs mingw
+// GCC 16.1.0/binutils): the compiler-generated TLS guard/init function
+// for an inline thread_local *variable* isn't COMDAT-folded across
+// object files on this PE/COFF target, so every TU that includes this
+// header (each of shim_sandbox's libw2g.a members, plus its consuming
+// executable) links its own copy and collides. A thread_local *function-
+// local static* behind an ordinary inline function uses a different,
+// long-standardized guard mechanism that this same toolchain has always
+// folded correctly (the pattern every portable Meyer's-singleton relies
+// on) -- so every access below goes through g_error_state() rather than
+// a bare variable.
+inline ErrorState& g_error_state() {
+  thread_local ErrorState state;
+  return state;
+}
+
+// RAII guard for bridge scope.  Guarantees leave_bridge() or
+// consume_panic() is called even if bridge code has an early return
+// or an unhandled branch.  gocvm::Call uses this instead of bare
+// enter_bridge()/leave_bridge() calls.
+struct BridgeScope {
+  bool entered = false;
+  bool consumed = false;
+
+  explicit BridgeScope(bool ok) : entered(ok) {}
+  BridgeScope(const BridgeScope&) = delete;
+  BridgeScope& operator=(const BridgeScope&) = delete;
+
+  ~BridgeScope() {
+    if (!entered || consumed) return;
+    // If we get here, nobody consumed or left — either a bug or an
+    // unhandled early return in gocvm::Call itself.  Reset to kClear
+    // so subsequent calls aren't stuck in kBridgeActive.
+    if (g_error_state().is_panic()) {
+      // Panic was stashed but nobody consumed it — surface it to
+      // stderr and reset, rather than silently swallowing.
+      std::cerr << "gocvm: unchecked bridge panic: "
+                << g_error_state().panic_msg << "\n";
+      g_error_state().consume_panic();
+    } else {
+      g_error_state().leave_bridge();
+    }
+  }
+
+  void mark_consumed() { consumed = true; }
+};
+
 // ---- panic / recover --------------------------------------------------------
 // wasi-sdk's noeh libc++ has no C++ exceptions. Its setjmp.h refuses to
 // compile without the wasm exception-handling proposal. User-level panic
 // in a function that has defer is therefore a compiler-emitted
 //   __pf.has_pending = true; goto __wasigo_end;
 // so DeferList runs on the way out and recover() can read the frame.
-// wasigo::panic() (bounds, nil map, send on closed chan) still aborts.
+//
+// When ErrorState is kBridgeActive (inside a gocvm::Call), panic() does
+// NOT abort — it stashes the message on g_error_state and returns.
+// The bridge code must cooperate by checking g_error_state().bridge_panicked()
+// and returning early (bool false); gocvm::Call then surfaces the stashed
+// message as a wasigo::Error.  Outside a bridge call, panic() still aborts.
 
 struct Recovered {
   bool ok = false;
@@ -175,16 +335,46 @@ inline PanicFrame::PanicFrame() : prev(g_panic_frame) { g_panic_frame = this; }
 inline PanicFrame::~PanicFrame() {
   g_panic_frame = prev;
   if (has_pending && !recovered) {
+    // If a bridge is active, promote to ErrorState rather than aborting.
+    if (g_error_state().is_bridge()) {
+      g_error_state().bridge_panic(std::move(pending));
+      return;
+    }
     std::cerr << "panic: " << pending << "\n";
     std::abort();
   }
 }
 
-// Runtime panics (bounds, nil map, ...) abort. A user-level `panic(x)` in a
-// function that has `defer` is compiled as "stash on the PanicFrame and
-// goto the function epilogue" so recover works on wasm32-wasip1 without
-// setjmp (wasi-sdk's setjmp requires the wasm exception-handling proposal).
+// panic() — runtime faults (bounds, nil map, send on closed chan, etc.).
+// Stays [[noreturn]] for generated code: outside a bridge, aborts.
+// Inside a gocvm bridge call (kBridgeActive), stash the message on
+// ErrorState.  The bridge must check g_error_state().bridge_panicked()
+// and return early; gocvm::Call surfaces it as a wasigo::Error.
+//
+// panic_or_stash() is the non-noreturn entry point for code that may
+// be called from inside a bridge and needs to handle the return.
+// panic() wraps it with an unconditional abort fallthrough so that
+// generated code (which is never inside a bridge) keeps [[noreturn]].
+inline bool panic_or_stash(std::string m) {
+  if (g_error_state().is_bridge()) {
+    g_error_state().bridge_panic(std::move(m));
+    return true;  // stashed — caller must return early
+  }
+  return false;  // not stashed — caller should abort
+}
 [[noreturn]] inline void panic(std::string m) {
+  if (panic_or_stash(std::string(m))) {
+    // Inside a bridge: panic_or_stash stashed the message.  We still
+    // need to unwind to the bridge's Call() return.  Since noeh has no
+    // exceptions and no longjmp, the bridge itself must cooperate by
+    // checking bridge_panicked().  But panic() call sites in generated
+    // code (the only ones that rely on [[noreturn]]) are never inside a
+    // bridge, so this path is unreachable for them.  For bridge code
+    // that calls panic(), use panic_or_stash() directly instead.
+    //
+    // If we do somehow reach here (bug), abort is still safe.
+    std::abort();
+  }
   std::cerr << "panic: " << m << "\n";
   std::abort();
 }
@@ -1176,6 +1366,91 @@ inline Error os_write_file(const std::string& name, Slice<uint8_t> data, int64_t
   return Error();
 }
 
+// ---- os.FileInfo / os.Stat ------------------------------------------------
+// Backed by plain <sys/stat.h> `stat(2)` -- wasi-libc implements it via
+// WASI's path_filestat_get the same way it implements fopen/fread above, and
+// the same call compiles unmodified under a native (non-WASI) g++/clang++,
+// which is what the CMake "_native" golden tests actually link against (see
+// go++/CMakeLists.txt's wasigo_add_golden -- wasi-sdk only supplies the
+// separate wasm proof). Bounded to what a directory-walking caller
+// (goxx/uniloader/bundle.Collect, the first caller) needs: Name/Size/IsDir.
+// No Mode()/ModTime()/Sys() -- those would need a real os.FileMode with
+// String/Perm methods and a real time.Time built from a raw struct stat,
+// more than any caller here exercises yet.
+struct FileInfo {
+  std::string name_;
+  int64_t size_ = 0;
+  bool is_dir_ = false;
+
+  std::string Name() const { return name_; }
+  int64_t Size() const { return size_; }
+  bool IsDir() const { return is_dir_; }
+};
+
+struct OsStatResult {
+  FileInfo r0;
+  Error r1{};
+};
+inline OsStatResult os_stat(const std::string& name) {
+  struct stat st;
+  if (::stat(name.c_str(), &st) != 0) {
+    return {FileInfo{}, errors_new("stat " + name + ": no such file or directory")};
+  }
+  FileInfo fi;
+  size_t slash = name.find_last_of('/');
+  fi.name_ = slash == std::string::npos ? name : name.substr(slash + 1);
+  fi.size_ = static_cast<int64_t>(st.st_size);
+  fi.is_dir_ = S_ISDIR(st.st_mode) != 0;
+  return {fi, Error()};
+}
+
+// ---- os.DirEntry / os.ReadDir ----------------------------------------------
+// Real directory listing via <dirent.h> opendir/readdir/closedir -- wasi-libc
+// implements these on top of WASI preview 1's real fd_readdir, so this is
+// genuine enumeration, not a stub (unlike os/exec's "not supported on
+// wasm32-wasip1", where WASI truly has no such syscall at all). IsDir() is
+// resolved with a follow-up `stat` per entry rather than trusting
+// dirent::d_type: d_type is a BSD/glibc extension WASI's dirent shim does
+// populate, but a native (non-WASI) libc used by the "_native" golden-test
+// build (see os_stat's comment above) is not guaranteed to, and this
+// function has to compile and run correctly under both. Entries come back
+// sorted by name, matching real Go's os.ReadDir contract.
+struct DirEntry {
+  std::string name_;
+  bool is_dir_ = false;
+
+  std::string Name() const { return name_; }
+  bool IsDir() const { return is_dir_; }
+};
+
+struct OsReadDirResult {
+  Slice<DirEntry> r0;
+  Error r1{};
+};
+inline OsReadDirResult os_read_dir(const std::string& name) {
+  DIR* d = ::opendir(name.c_str());
+  if (!d) {
+    return {Slice<DirEntry>{}, errors_new("readdir " + name + ": no such directory")};
+  }
+  std::vector<DirEntry> entries;
+  for (struct dirent* ent = ::readdir(d); ent != nullptr; ent = ::readdir(d)) {
+    std::string n = ent->d_name;
+    if (n == "." || n == "..") continue;
+    struct stat st;
+    DirEntry de;
+    de.name_ = n;
+    de.is_dir_ = ::stat((name + "/" + n).c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    entries.push_back(std::move(de));
+  }
+  ::closedir(d);
+  std::sort(entries.begin(), entries.end(),
+            [](const DirEntry& a, const DirEntry& b) { return a.name_ < b.name_; });
+  Slice<DirEntry> out;
+  out.buf = std::make_shared<std::vector<DirEntry>>(std::move(entries));
+  out.len_ = out.buf->size();
+  return {out, Error()};
+}
+
 inline std::string string_from_bytes(const Slice<uint8_t>& s) {
   if (!s.buf || s.len_ == 0) return {};
   return std::string(reinterpret_cast<const char*>(&(*s.buf)[s.off]), s.len_);
@@ -1380,10 +1655,176 @@ void gclear(Slice<T> s) {
   for (int64_t i = 0; i < s.len(); ++i) s[i] = T{};
 }
 
+// ---- gocvm --------------------------------------------------------------
+// The one dispatch gate between compiled Go++ code and a native host
+// bridge (e.g. ~/shim_sandbox's real Winsock/Win32 backends, wired in
+// under `goclang++.bat --shim-sandbox`). Not a generic FFI: gocvm.Call is
+// the single Go-visible entry point (see cpp_generator.cc's "gocvm"
+// EmitCall branch) -- every crossing goes through the same ABAC check and
+// comes back as a normal wasigo::Error naming the topic, the same shape
+// os/exec's, os/user's, and syscall's own stub errors already have.
+namespace gocvm {
+
+inline constexpr const char* kNoBridge =
+    "no host bridge registered (build with goclang++.bat "
+    "--shim-sandbox to link one)";
+
+class HostBridge {
+ public:
+  virtual ~HostBridge() = default;
+  // Synchronous dispatch inside the calling goroutine's coroutine frame.
+  // wasigo is single-threaded cooperative, so blocking here is exactly
+  // as safe as os_open's synchronous fread already is.
+  //
+  // ErrorState contract: gocvm::Call sets g_error_state to kBridgeActive
+  // before calling this.  If anything inside the bridge (or code it
+  // calls) hits panic(), the message is stashed on g_error_state and
+  // panic_or_stash() returns true.  The bridge MUST check
+  //   g_error_state().bridge_panicked()
+  // after any operation that could panic and return false immediately.
+  // gocvm::Call will then surface the stashed message as a wasigo::Error.
+  //
+  // Do NOT use C++ throw — noeh builds have no exception support.
+  virtual bool Call(const std::string& topic, const std::string& payload,
+                    std::string* reply_out, std::string* err_out) = 0;
+};
+
+class AbacHook {
+ public:
+  virtual ~AbacHook() = default;
+  virtual bool Check(const std::string& topic) = 0;
+};
+
+namespace detail {
+inline HostBridge*& bridge_slot() {
+  static HostBridge* b = nullptr;
+  return b;
+}
+inline AbacHook*& abac_slot() {
+  static AbacHook* a = nullptr;
+  return a;
+}
+}  // namespace detail
+
+// A plain wasi-sdk build never calls these -- registration only happens
+// from set_os_args's WASIGO_GOCVM_BRIDGE hook below, which only exists
+// when goclang++.bat --shim-sandbox defined it.
+inline void RegisterHostBridge(HostBridge* b) { detail::bridge_slot() = b; }
+inline void RegisterAbacHook(AbacHook* a) { detail::abac_slot() = a; }
+
+// Virtual-thread registry entry: one per goroutine actually spawned via
+// go() (not per co_await'd helper coroutine -- same distinction Go's own
+// `go` statement draws). cppgc-managed so its lifetime -- and, later, any
+// GC-managed pending-call state it grows -- participates in the same
+// wasigo::gc::Heap as everything else. Owned by a gc::Persistent held in
+// the spawned coroutine's own promise_type (see the three go() overloads
+// below), so it is rooted for exactly the coroutine frame's lifetime with
+// no separate registry list to keep in sync by hand.
+struct VThread : gc::GarbageCollected<VThread> {
+  enum class State { kRunning, kAwaitingHost };
+  uint64_t id = 0;
+  // v0's Call() below is synchronous (no suspension point), so nothing
+  // transitions this yet -- it's here so a future suspending dispatch
+  // doesn't need a VThread redesign, not a currently-live state machine.
+  State state = State::kRunning;
+  void Trace(gc::Visitor&) const override {}
+};
+
+inline VThread* RegisterThread() {
+  auto* t = gc::heap().Make<VThread>();
+  static uint64_t next_id = 0;
+  t->id = ++next_id;
+  return t;
+}
+
+// (string, error) -- the same "rN field per return value" shape every
+// multi-return Go++ function compiles to (see cpp_generator.cc's
+// EmitAssign, and wasigo::OsOpenResult for the precedent), so `s, err :=
+// gocvm.Call(...)` unpacks through the ordinary multi-return codegen path
+// with no special-casing beyond the EmitCall branch that names this type.
+struct CallResult {
+  std::string r0;
+  Error r1{};
+};
+
+// The one dispatch primitive. ABAC deny and "no bridge" both come back as
+// a normal wasigo::Error naming the topic -- once a real bridge is
+// registered these stop always being the same canned string, same as
+// every existing stdlib stub's error already reads.
+//
+// The single SFI error boundary.  ErrorState transitions:
+//   kClear → kBridgeActive (enter_bridge)
+//   kBridgeActive → kPanic  (if bridge or anything it calls hits panic())
+//   kBridgeActive → kClear  (leave_bridge, success)
+//   kPanic → kClear         (consume_panic, surfaced as wasigo::Error)
+//
+// No C++ exceptions, no setjmp.  Works identically on noeh and native.
+//
+// BridgeScope RAII guarantees kBridgeActive is never leaked, even if a
+// future maintainer adds an early return.
+//
+// Cooperative yield safety: bridge calls are synchronous run-to-completion
+// (HostBridge::Call never co_awaits or yields back to the VThread
+// scheduler), so a single thread-local ErrorState has zero risk of
+// cross-coroutine contamination.  If a future bridge needs to suspend
+// mid-call, ErrorState must move onto the VThread or become per-coroutine.
+//
+// recover() stays localised to explicit defer wrappers (PanicFrame +
+// goto __wasigo_end) — the same-function-only semantics documented in
+// language.md.  ErrorState does not change recover's reach; it only
+// prevents abort at the SFI boundary so that gocvm::Call can surface
+// bridge panics as wasigo::Error instead.
+inline CallResult Call(const std::string& topic, const std::string& payload) {
+  if (detail::abac_slot() && !detail::abac_slot()->Check(topic)) {
+    return {std::string(), Error("gocvm: " + topic + ": abac deny")};
+  }
+  if (!detail::bridge_slot()) {
+    return {std::string(), Error("gocvm: " + topic + ": " + std::string(kNoBridge))};
+  }
+  BridgeScope scope(g_error_state().enter_bridge());
+  if (!scope.entered) {
+    return {std::string(),
+            Error("gocvm: " + topic + ": reentrant bridge call")};
+  }
+
+  std::string reply, err;
+  bool ok = detail::bridge_slot()->Call(topic, payload, &reply, &err);
+
+  // Check for a panic that fired inside the bridge (or anything it called).
+  if (g_error_state().is_panic()) {
+    std::string msg = g_error_state().consume_panic();
+    scope.mark_consumed();
+    return {std::string(),
+            Error("gocvm: " + topic + ": bridge panic: " + msg)};
+  }
+
+  g_error_state().leave_bridge();
+  scope.mark_consumed();
+
+  if (!ok) {
+    return {std::string(), Error("gocvm: " + topic + ": " + err)};
+  }
+  return {std::move(reply), Error()};
+}
+
+}  // namespace gocvm
+
+#if defined(WASIGO_GOCVM_BRIDGE) && WASIGO_GOCVM_BRIDGE
+// Defined by shim_sandbox (src/gocvm_bridge.cc), linked in only when
+// goclang++.bat --shim-sandbox passed -DWASIGO_GOCVM_BRIDGE=1. (A
+// linkage-specification like `extern "C"` is only valid at namespace
+// scope, not inside a function body, hence the forward declaration up
+// here rather than next to its one call site below.)
+extern "C" void wasigo_gocvm_install_bridge();
+#endif
+
 inline void set_os_args(int argc, char** argv) {
   auto& a = os_args_store();
   a = make_slice<std::string>(argc < 0 ? 0 : argc);
   for (int i = 0; i < argc; ++i) a[i] = argv[i] ? argv[i] : "";
+#if defined(WASIGO_GOCVM_BRIDGE) && WASIGO_GOCVM_BRIDGE
+  wasigo_gocvm_install_bridge();
+#endif
 }
 
 // ---- Map<K,V> ---------------------------------------------------------------
@@ -1486,6 +1927,10 @@ struct Task {
   struct promise_type {
     std::coroutine_handle<> continuation{};
     bool detached = false;
+    // Only set when go() actually spawns this coroutine as a goroutine
+    // (see go() below) -- rooted for exactly this frame's lifetime, no
+    // separate registry to keep in sync by hand.
+    gc::Persistent<gocvm::VThread> vthread;
 
     Task get_return_object() {
       return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -1550,6 +1995,10 @@ struct TaskT {
     std::coroutine_handle<> continuation{};
     bool detached = false;
     T value{};
+    // Only set when go() actually spawns this coroutine as a goroutine
+    // (see go() below) -- rooted for exactly this frame's lifetime, no
+    // separate registry to keep in sync by hand.
+    gc::Persistent<gocvm::VThread> vthread;
 
     TaskT get_return_object() {
       return TaskT{std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -1617,6 +2066,7 @@ inline void Scheduler::run() {
 inline void go(Task t) {
   if (!t.h) return;
   t.h.promise().detached = true;
+  t.h.promise().vthread = gocvm::RegisterThread();
   scheduler().enqueue(t.h);
   t.h = {};
 }
@@ -1625,6 +2075,7 @@ template<class T>
 void go(TaskT<T> t) {
   if (!t.h) return;
   t.h.promise().detached = true;
+  t.h.promise().vthread = gocvm::RegisterThread();
   scheduler().enqueue(t.h);
   t.h = {};
 }

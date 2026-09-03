@@ -19,7 +19,7 @@ surfaced: [design-log.md](design-log.md) (tracker from
 | --- | --- | --- |
 | `fmt` | `Print`/`Println`/`Sprint`/`Sprintln`/`Printf`/`Sprintf`/`Errorf`/`Fprint*` | format string must be a **literal**; verbs `%d %s %f %v %t %c %w %%` only; no `Scan*` |
 | `errors` | `New`, `Is`, `Unwrap`, `Join` | `As` |
-| `os` | `Args`, `Exit`, `Getenv`, `File` (`Open`/`Create`/`ReadFile`/`WriteFile`, `Read`/`Write`/`Close`), std streams | dirs, `Setenv`, process, `Remove`/`Mkdir`/`Stat` |
+| `os` | `Args`, `Exit`, `Getenv`, `File` (`Open`/`Create`/`ReadFile`/`WriteFile`, `Read`/`Write`/`Close`), std streams, `Stat`/`FileInfo`, `ReadDir`/`DirEntry` (real, via `stat(2)`/`opendir`+`readdir`) | `Setenv`, process, `Remove`/`Mkdir` |
 | `reflect` | `TypeOf`/`ValueOf`, `Value`/`Type` (`Kind`/`Name`/`NumField`/`Field`/`FieldName`/`Interface`/`Int`/`Float`/`Bool`/`String`, `Set*`) | no Chan/Func Kind |
 
 Host file I/O from a WASI guest should go through

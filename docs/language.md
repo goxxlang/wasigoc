@@ -27,6 +27,7 @@ import alias "path"          // blank `_ "path"` runs init only; no `import .`
 
 type Name struct {
   Field Type
+  A, B Type             // grouped field names share one type
   ...
 }
 
@@ -34,7 +35,9 @@ func Name(param Type, ...) [Type | (name Type, ...)] { ... }
 func (recv [*]Name) Method(param Type, ...) [Type | (Type, ...)] { ... }
 func init() { ... }          // once per package, dependencies first, before main
 
-type Name T                  // defined type (distinct C++ type if it has methods). `type Name = T` is `using`
+type Name T                  // or `type Name = T` -- C++ `using` (not a distinct type)
+type Name []T                // named slice type
+type Name [N]T                // named array type; N a literal or a named constant
 
 var x [Type] [= expr]        // grouped: var ( x = 1; y = 2 )
 const x [Type] [= expr]      // iota in a const group is folded to constexpr
@@ -46,7 +49,7 @@ select { case ch <- x: ... case v[, ok] := <-ch: ... default: ... }
 for { ... }
 for cond { ... }
 for init; cond; post { ... }
-for [k[, v]] := range expr { ... }   // slice, array, *array, map, string, chan, integer, iterator func
+for [k[, v]] := range expr { ... }   // slice, array, *array, map, string, chan, integer
 go expr
 defer expr
 ch <- x  /  <-ch  /  v, ok := <-ch
@@ -86,8 +89,9 @@ flatten into the outer vtable. Embedding is public C++ inheritance.
 Anonymous `interface{ M() }` intern to the same generated adapter as a
 named interface with the same method set. Generic named types
 (`type Set[T any] struct`) are C++ class templates; `Set[int]` is
-`Set<int64_t>`. Range-over-func (`for v := range seq`) calls the iterator
-with a yield callback.
+`Set<int64_t>`, both as a `var` declaration and instantiated directly as
+a composite literal (`Set[int]{...}`). Range-over-func (`for v := range
+seq`) calls the iterator with a yield callback.
 
 A function that does `<-` / `select` becomes a C++20 coroutine (`Task` /
 `TaskT<T>`). `go` captures **by value**. Slice/map/chan nil and OOB

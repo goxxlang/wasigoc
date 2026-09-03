@@ -2,13 +2,13 @@
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-rem compile — build wasigoc (host) and optionally compile a Go++ program
+rem compile.bat — build wasigoc (host) and optionally compile a Go++ program
 rem to wasm32-wasip1. Matches CMakeLists.txt and docs/build.md.
 rem
-rem   compile                              build wasigoc (Release)
-rem   compile Debug                        build wasigoc (Debug)
-rem   compile examples\hello\hello.go compile Go++ -> .wasm
-rem   compile hello.go -o out.wasm        same, explicit wasm path
+rem   compile.bat                         build wasigoc (Release)
+rem   compile.bat Debug                   build wasigoc (Debug)
+rem   compile.bat examples\hello\hello.go compile Go++ -> .wasm
+rem   compile.bat hello.go -o out.wasm    same, explicit wasm path
 
 set "CONFIG=Release"
 set "GOFILE="
@@ -69,14 +69,14 @@ if errorlevel 1 exit /b 1
 if not defined GOFILE (
   echo.
   echo wasigoc: !WASIGOC_EXE!
-  echo usage: compile ^<file.go^> [-o out.wasm]
+  echo usage: compile.bat ^<file.go^> [-o out.wasm]
   exit /b 0
 )
 call :compile_go
 exit /b %ERRORLEVEL%
 
 :usage
-echo usage: compile [Debug^|Release] [^<input.go^> [-o out.wasm] [wasigoc flags...]]
+echo usage: compile.bat [Debug^|Release] [^<input.go^> [-o out.wasm] [wasigoc flags...]]
 echo.
 echo   no .go file   build the host compiler wasigoc.exe
 echo   input.go      transpile with wasigoc, then wasm32-wasip1-clang++

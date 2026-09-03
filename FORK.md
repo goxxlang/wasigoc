@@ -1,16 +1,11 @@
-# WASIGo++ / wasigoc
+# go++ (fork of WASIGo++)
 
-This directory (`~/WASIGo++`) is the canonical checkout of
-[goxxlang/wasigoc](https://github.com/goxxlang/wasigoc).
+This is a working copy of `~/WASIGo++`. **Do not edit `~/WASIGo++` from this
+tree.** Changes here are the goxxlang netstack + JSON work.
 
-Language-surface work (lexer/parser completeness, interned `go/types`,
-defined-type methods, generic named types, anonymous interfaces,
-range-over-func) was developed in a `~/go++` working copy and merged
-back here.
+## Userspace netstack (`stdlib/net`)
 
-Release 0.2.1 is ready to roll from `~/go++` with the builtin `gocvm`.
-
-WASI preview 1 still has no sockets. The userspace stack is `net.Pipe`:
+WASI preview 1 still has no sockets. The stack is `net.Pipe`:
 
 | API | What it is |
 |-----|------------|
@@ -21,8 +16,11 @@ WASI preview 1 still has no sockets. The userspace stack is `net.Pipe`:
 | `SplitHostPort` / `JoinHostPort` | `"host:port"` and `[::1]:port` |
 | `net/http` | HTTP/1.0 `Get`/`Post`, `Serve`/`ServeHandler`, `ServeMux` |
 
-`Dial("tcp", "example.com:80")` still fails — no host sockets.
+`Dial("tcp", "example.com:80")` still fails — no host sockets. Bind two
+guests later by attaching a Pipe as the uplink.
+
+## JSON
 
 `encoding/json` Unmarshal into a struct pointer, nested structs, and
-Marshal of a slice of structs. Struct tags `json:"name"` and `json:"-"`
-rename or omit fields.
+Marshal of a slice of structs. Field `Set*` writes through `adapt_ptr`.
+Struct tags `json:"name"` and `json:"-"` rename or omit fields.

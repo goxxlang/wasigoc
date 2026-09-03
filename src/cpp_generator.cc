@@ -136,6 +136,20 @@ File BuildOsBuiltinFile() {
   sd.name = "File";
   f.structs.push_back(std::move(sd));
 
+  // os.FileInfo / os.DirEntry: like File above, these have no Go-source
+  // method bodies -- LookupMethod finds the FuncDecl (so `fi.IsDir()`
+  // resolves and type-checks) and NamedCppType maps the receiver straight
+  // to a hand-written wasigo::FileInfo/DirEntry struct (see runtime.hpp)
+  // that supplies the real implementation, the same split File's
+  // Read/Write/Close already use.
+  StructDecl fi_sd;
+  fi_sd.name = "FileInfo";
+  f.structs.push_back(std::move(fi_sd));
+
+  StructDecl de_sd;
+  de_sd.name = "DirEntry";
+  f.structs.push_back(std::move(de_sd));
+
   auto byteSlice = [] {
     auto t = std::make_unique<TypeNode>();
     t->kind = TypeKind::Slice;
@@ -214,6 +228,60 @@ File BuildOsBuiltinFile() {
   write_file.params.push_back(param("perm", MakeNamedType("int")));
   write_file.results = results1(MakeNamedType("error"));
   f.funcs.push_back(std::move(write_file));
+
+  auto method0 = [&](const char* recv_type, const char* name, std::unique_ptr<TypeNode> result) {
+    FuncDecl m;
+    m.has_receiver = true;
+    m.receiver_name = "x";
+    m.receiver_type = recv_type;
+    m.receiver_is_pointer = false;
+    m.name = name;
+    m.results = results1(std::move(result));
+    f.funcs.push_back(std::move(m));
+  };
+  method0("FileInfo", "Name", MakeNamedType("string"));
+  method0("FileInfo", "Size", MakeNamedType("int64"));
+  method0("FileInfo", "IsDir", MakeNamedType("bool"));
+  method0("DirEntry", "Name", MakeNamedType("string"));
+  method0("DirEntry", "IsDir", MakeNamedType("bool"));
+
+  FuncDecl stat;
+  stat.name = "Stat";
+  stat.params.push_back(param("name", MakeNamedType("string")));
+  stat.results = results2(MakeNamedType("FileInfo", "os"), MakeNamedType("error"));
+  f.funcs.push_back(std::move(stat));
+
+  FuncDecl read_dir;
+  read_dir.name = "ReadDir";
+  read_dir.params.push_back(param("name", MakeNamedType("string")));
+  auto dirEntrySlice = [] {
+    auto t = std::make_unique<TypeNode>();
+    t->kind = TypeKind::Slice;
+    t->elem = MakeNamedType("DirEntry", "os");
+    return t;
+  };
+  read_dir.results = results2(dirEntrySlice(), MakeNamedType("error"));
+  f.funcs.push_back(std::move(read_dir));
+
+  return f;
+}
+
+// gocvm: the one dispatch gate to a native host bridge (see
+// wasigo::gocvm::Call in runtime.hpp and docs/design-log.md). Like `os`,
+// this is a builtin with no real stdlib/gocvm/*.go source -- Call is the
+// single function, wired straight to wasigo::gocvm::Call by EmitCall's
+// "gocvm" branch, the same way os.Getenv routes to wasigo::os_getenv.
+File BuildGocvmBuiltinFile() {
+  File f;
+  f.package_name = "gocvm";
+
+  FuncDecl call;
+  call.name = "Call";
+  call.params.push_back(Param{"topic", MakeNamedType("string")});
+  call.params.push_back(Param{"payload", MakeNamedType("string")});
+  call.results.push_back(MakeNamedType("string"));
+  call.results.push_back(MakeNamedType("error"));
+  f.funcs.push_back(std::move(call));
 
   return f;
 }
@@ -394,10 +462,23 @@ class Generator {
     EmitStructForwardDecls();
     EmitInterfaceDefs();
     EmitFreeFuncPrototypes();
+    // Struct field-only skeletons before result-struct defs, not after: a
+    // multi-return function whose result struct holds a plain STRUCT type
+    // BY VALUE (e.g. `func Foo() (Header, error)` -> `struct FooResult {
+    // Header r0{}; ... }`) needs `Header` at least field-complete right
+    // here -- a forward declaration (what EmitStructForwardDecls gives it)
+    // is not enough for a by-value member, unlike EmitInterfaceDefs/
+    // EmitFreeFuncPrototypes above, which only ever use such types as
+    // return/parameter types (forward decl is enough there, see the
+    // comment on EmitStructForwardDecls/EmitInterfaceDefs's own ordering).
+    // Every earlier multi-return function returned a pointer or a builtin
+    // in that slot, never a plain named struct by value -- found porting
+    // uniloader's bundle package (decodeHeader() (Header, error),
+    // Bundle.Get() (File, error)).
+    EmitStructDefs();
     EmitResultStructDefs();
     EmitSimpleConstDecls();
     EmitGlobalForwardDecls();
-    EmitStructDefs();
     // See EmitMethodOutOfLine's own comment: a struct method's body needs
     // every OTHER struct type it touches complete, which only just
     // became true (every struct now has its field-only skeleton).
@@ -665,6 +746,10 @@ class Generator {
       static const File kReflectFile = BuildReflectBuiltinFile();
       return &kReflectFile;
     }
+    if (pkg == "gocvm") {
+      static const File kGocvmFile = BuildGocvmBuiltinFile();
+      return &kGocvmFile;
+    }
     for (const File* f : opt_.imported_files) {
       if (f && f->package_name == pkg) return f;
     }
@@ -684,7 +769,8 @@ class Generator {
     for (auto& spec : file_.import_specs) {
       if (spec.local == "_") continue;
       std::string dest = spec.path;
-      if (dest == "fmt" || dest == "errors" || dest == "os" || dest == "reflect") {
+      if (dest == "fmt" || dest == "errors" || dest == "os" || dest == "reflect" ||
+          dest == "gocvm") {
         std::string local = spec.local.empty() ? dest : spec.local;
         pkg_alias_[local] = dest;
         continue;
@@ -709,7 +795,7 @@ class Generator {
 
   bool IsImportedPackage(const std::string& name) const {
     const std::string n = PkgOf(name);
-    if (n == "fmt" || n == "errors" || n == "os" || n == "reflect") return false;
+    if (n == "fmt" || n == "errors" || n == "os" || n == "reflect" || n == "gocvm") return false;
     return FindPackage(n) != nullptr && n != file_.package_name;
   }
 
@@ -1548,6 +1634,8 @@ class Generator {
     // struct parsed from .go source -- "os" is one of the three special
     // packages (fmt/errors/os) that don't load a real stdlib/os/*.go.
     if (t->kind == TypeKind::Named && t->pkg == "os" && t->name == "File") return "wasigo::File";
+    if (t->kind == TypeKind::Named && t->pkg == "os" && t->name == "FileInfo") return "wasigo::FileInfo";
+    if (t->kind == TypeKind::Named && t->pkg == "os" && t->name == "DirEntry") return "wasigo::DirEntry";
     // reflect.Value and reflect.Type are both wasigo::Any under the hood
     // (see BuildReflectBuiltinFile) -- same reasoning as os.File above.
     if (t->kind == TypeKind::Named && t->pkg == "reflect" &&
@@ -2448,7 +2536,15 @@ class Generator {
     if (t->kind == TypeKind::Named) {
       const StructDecl* sd = LookupStruct(t->name, t->pkg);
       if (!sd) Error("composite literal for unknown struct type '" + t->name + "'");
-      std::string tn = QualName(t->pkg, t->name);
+      // Plain QualName (no `<Args>`) is fine for a non-generic struct, but
+      // a generic one (`Pair[T]{...}`, type args attached by the parser's
+      // expression-position instantiation, see ParsePostfix) needs the
+      // explicit template arguments here -- `Pair __s{};` relies on CTAD,
+      // which fails outright since no constructor argument exists yet to
+      // deduce T from. CppType/NamedCppType already knows how to append
+      // `<Args>` when t->type_args is non-empty, and is a no-op string
+      // (same as QualName) when it's empty.
+      std::string tn = CppType(t);
       if (e.fields.empty() && e.elems.empty()) return tn + "{}";
       std::ostringstream oss;
       oss << LambdaCapture() << "{ " << tn << " __s{}; ";
@@ -3033,17 +3129,27 @@ class Generator {
           return "wasigo::os_getenv(" + EmitExpr(*e.args[0]) + ")";
         }
         if (sel->strval == "Open" || sel->strval == "Create" || sel->strval == "ReadFile" ||
-            sel->strval == "WriteFile") {
+            sel->strval == "WriteFile" || sel->strval == "Stat" || sel->strval == "ReadDir") {
           const FuncDecl* f = LookupFreeFunc(sel->strval, "os");
           std::string args = EmitArgsFor(f->params, e.args);
           std::string fn = sel->strval == "Open"       ? "os_open"
                             : sel->strval == "Create"   ? "os_create"
                             : sel->strval == "ReadFile"  ? "os_read_file"
-                                                          : "os_write_file";
+                            : sel->strval == "WriteFile" ? "os_write_file"
+                            : sel->strval == "Stat"      ? "os_stat"
+                                                          : "os_read_dir";
           return "wasigo::" + fn + "(" + args + ")";
         }
         Error("unsupported os function '" + sel->strval + "' (Args, Exit, Getenv, Open, Create, "
-              "ReadFile, WriteFile)");
+              "ReadFile, WriteFile, Stat, ReadDir)");
+      }
+      if (sel->x->kind == ExprKind::Ident && PkgOf(sel->x->strval) == "gocvm") {
+        if (sel->strval == "Call") {
+          const FuncDecl* f = LookupFreeFunc(sel->strval, "gocvm");
+          std::string args = EmitArgsFor(f->params, e.args);
+          return "wasigo::gocvm::Call(" + args + ")";
+        }
+        Error("unsupported gocvm function '" + sel->strval + "' (Call)");
       }
       if (sel->x->kind == ExprKind::Ident && IsImportedPackage(sel->x->strval)) {
         const std::string pkg = PkgOf(sel->x->strval);
@@ -3216,7 +3322,16 @@ class Generator {
         oss << "(" << CppIdent(name) << ")(";
         for (size_t i = 0; i < e.args.size(); ++i) {
           if (i) oss << ", ";
-          oss << EmitExpr(*e.args[i]);
+          // EmitExprAs, not EmitExpr: an untyped `nil` argument (e.g. a
+          // `func(..., error) ...`-typed callback called as `fn(x, nil)`,
+          // found porting go++/stdlib/path/filepath's new WalkDir) needs
+          // the same nil-spelling-by-target-type NilSpellingFor already
+          // gives ordinary package-function/method calls via EmitArgsFor
+          // -- plain EmitExpr always spells Nil as `nullptr`, which only
+          // compiles for a pointer parameter, not an error/interface/
+          // slice/map one (wasigo::Error has no nullptr_t constructor).
+          const TypeNode* pt = i < vt->func_params.size() ? vt->func_params[i].type.get() : nullptr;
+          oss << (pt ? EmitExprAs(*e.args[i], pt) : EmitExpr(*e.args[i]));
         }
         oss << ")";
         return oss.str();
@@ -3322,6 +3437,36 @@ class Generator {
         std::string args = f ? EmitArgsFor(f->params, e.args, pkg) : "";
         out_ << Indent() << "wasigo::go(" << QualName(pkg, e.callee->strval) << "(" << args << "));\n";
         return;
+      }
+      // `go recv.AsyncMethod(...)` (recv.AsyncMethod itself uses channels,
+      // so it returns wasigo::Task/TaskT, not the "ordinary callable" the
+      // generic fallback below assumes). That fallback wraps the call in
+      // `wasigo::go([=]{ recv.AsyncMethod(...); })`: a plain function-call
+      // *statement* on a Task-returning method constructs the Task,
+      // immediately discards it (dtor runs at the end of the full
+      // expression since it was never passed to go() or co_awaited), and
+      // ~Task destroys the not-yet-started coroutine frame outright --
+      // the method body never runs at all, and anything co_awaiting a
+      // result from it (e.g. a "done" channel it's supposed to close)
+      // deadlocks forever. Pass the Task straight to wasigo::go(...)
+      // instead, same as the free-function/package-function cases above.
+      if (e.callee->kind == ExprKind::Selector && e.callee->x &&
+          !(e.callee->x->kind == ExprKind::Ident && IsImportedPackage(e.callee->x->strval))) {
+        auto baseType = InferType(e.callee->x.get());
+        const TypeNode* structT =
+            baseType && baseType->kind == TypeKind::Pointer ? baseType->elem.get() : baseType;
+        if (structT && structT->kind == TypeKind::Named) {
+          if (const FuncDecl* m = LookupMethod(structT->name, e.callee->strval, structT->pkg)) {
+            if (IsAsyncMethod(structT->name, e.callee->strval)) {
+              std::string base_str = EmitExpr(*e.callee->x);
+              std::string arrow = baseType->kind == TypeKind::Pointer ? "->" : ".";
+              std::string args = EmitArgsFor(m->params, e.args, structT->pkg);
+              out_ << Indent() << "wasigo::go(" << base_str << arrow << e.callee->strval << "("
+                   << args << "));\n";
+              return;
+            }
+          }
+        }
       }
       if (e.callee->kind == ExprKind::FuncLit) {
         out_ << Indent() << "wasigo::go((" << EmitExpr(*e.callee) << ")());\n";
@@ -3856,12 +4001,14 @@ class Generator {
     if (call.callee->kind == ExprKind::Ident) return LookupFreeFunc(call.callee->strval);
     if (call.callee->kind == ExprKind::Selector) {
       auto* sel = call.callee.get();
-      // IsImportedPackage excludes "os" (it's a builtin, not a loaded
-      // stdlib/os/*.go -- see BuildOsBuiltinFile), but os.Open/Create/
-      // ReadFile/WriteFile still need their synthetic FuncDecl found here
-      // so `f, err := os.Open(...)` unpacks through the normal path.
+      // IsImportedPackage excludes "os"/"gocvm" (builtins, not a loaded
+      // stdlib/*.go -- see BuildOsBuiltinFile/BuildGocvmBuiltinFile), but
+      // os.Open/Create/ReadFile/WriteFile and gocvm.Call still need their
+      // synthetic FuncDecl found here so `f, err := os.Open(...)` / `s,
+      // err := gocvm.Call(...)` unpack through the normal path.
       if (sel->x->kind == ExprKind::Ident &&
-          (IsImportedPackage(sel->x->strval) || PkgOf(sel->x->strval) == "os")) {
+          (IsImportedPackage(sel->x->strval) || PkgOf(sel->x->strval) == "os" ||
+           PkgOf(sel->x->strval) == "gocvm")) {
         const std::string pkg = PkgOf(sel->x->strval);
         if (out_pkg) *out_pkg = pkg;
         return LookupFreeFunc(sel->strval, pkg);

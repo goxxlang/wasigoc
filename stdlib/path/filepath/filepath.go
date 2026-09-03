@@ -2,6 +2,8 @@
 // separators; paths are slash-separated the same as package path.
 package filepath
 
+import "errors"
+
 func Base(name string) string {
 	if name == "" {
 		return "."
@@ -148,4 +150,49 @@ func Clean(path string) string {
 		return "."
 	}
 	return res
+}
+
+// Rel returns a relative path that is lexically equivalent to target when
+// joined to base with an intervening slash. Bounded subset of real Go's
+// Rel: no volume names (WASI has none) and no case-insensitive comparison --
+// otherwise the same common-prefix-then-climb algorithm.
+func Rel(base string, target string) (string, error) {
+	base = Clean(base)
+	target = Clean(target)
+	if base == target {
+		return ".", nil
+	}
+	if IsAbs(base) != IsAbs(target) {
+		return "", errors.New("Rel: can't make " + target + " relative to " + base)
+	}
+	baseSegs := splitSegs(base)
+	targetSegs := splitSegs(target)
+	i := 0
+	for i < len(baseSegs) && i < len(targetSegs) && baseSegs[i] == targetSegs[i] {
+		i++
+	}
+	for j := i; j < len(baseSegs); j++ {
+		if baseSegs[j] == ".." {
+			return "", errors.New("Rel: can't make " + target + " relative to " + base)
+		}
+	}
+	rel := ""
+	for j := i; j < len(baseSegs); j++ {
+		if rel == "" {
+			rel = ".."
+		} else {
+			rel = rel + "/.."
+		}
+	}
+	for j := i; j < len(targetSegs); j++ {
+		if rel == "" {
+			rel = targetSegs[j]
+		} else {
+			rel = rel + "/" + targetSegs[j]
+		}
+	}
+	if rel == "" {
+		return ".", nil
+	}
+	return rel, nil
 }
