@@ -71,6 +71,19 @@ work. Flags: [docs/build.md](docs/build.md).
   (certificate validation always on), real user/env lookups, via GocVM.
   See the "Names" table above and [docs/design-log.md](docs/design-log.md)'s
   diary.
+- Type identity: interned `go/types` (pointer equality) and matching
+  C++ codegen — methods on defined types (`type Duration int64`),
+  generic named types (`type Set[T any] struct`), anonymous
+  `interface{ M() }`, range-over-func, named array/slice types.
+- GC: Oilpan-lite (cppgc) — `GarbageCollected<T>`, `Member<T>`,
+  `Persistent<T>`, stop-the-world mark-sweep via `Trace`/`Visitor`. No
+  Go collector clone — C++ Oilpan on a single-thread target.
+- VThreads: cooperative virtual threads registered through the same
+  Oilpan-lite GC (`gocvm::VThread`) — goroutines are C++20 stackless
+  coroutines on a single runqueue (no OS threads, no wasi-threads), and
+  a `VThread` also tracks a goroutine suspended on a real GocVM host
+  call (`State::kAwaitingHost`) so that call doesn't block every other
+  goroutine while it's in flight.
 
 Language surface and Rosetta table: [docs/language.md](docs/language.md).
 Stdlib status: [docs/stdlib.md](docs/stdlib.md). Per-package tracker and
