@@ -1603,6 +1603,91 @@ wasm32-wasip1 path, confirming `CallAsync`'s immediate no-bridge/ABAC-
 deny branch still produces byte-identical fallback output), `shim_sandbox`
 2/2.
 
+**Same day, one more round -- real thread-safety for Chan/Map/gc::Heap,
+and a genuine GC concurrency bug found and fixed.** Asked why GocVM
+couldn't just use real OS threads throughout (not just the one bridge
+worker thread): wasm32-wasip1 has no threading at all in this project's
+target configuration (no wasi-threads dependency, by design -- see
+Scheduler's own comment), and even on native, `Chan`/`Slice`/`Map`/the
+GC heap have zero synchronization today because exactly one thread ever
+touched them. Asked to build that synchronization out as prerequisite
+work (not something today's behavior depends on).
+
+Scoped deliberately per-type, matching what real Go actually
+guarantees rather than blanket-locking everything: **Chan\<T\>** gets
+real locking (Go guarantees channel safety across goroutines) --
+`State::mu`, each plain awaiter re-checking readiness under the lock
+inside `await_suspend` (C++20's "return `false`, don't actually
+suspend" signal closes the `await_ready`-releases/`await_suspend`-
+reacquires race window), `GSelect` locking every participating
+channel together for its whole check-then-park sequence, address-
+sorted the same way real Go's own `selectgo` orders its channel locks
+so two concurrent selects sharing channels can never deadlock each
+other. **Map\<K,V\>** gets NO locking -- real Go doesn't protect maps
+either (concurrent access is documented UB there too) -- instead the
+same *failure mode*: a `hashWriting`-style atomic flag that panics
+("fatal error: concurrent map writes"/"...read and map write") on
+detected contention instead of silently corrupting, matching real Go's
+own detect-and-crash contract rather than being more forgiving than
+the language it's modeling. **Slice\<T\>** gets nothing at all,
+deliberately: real Go slices have zero runtime protection either, and
+adding locking here would be a parity regression (Go++ programs
+racing a slice would silently "work" where the equivalent real Go
+program is genuine UB). **`gc::Heap`/`Persistent<T>`**: mutex-protected
+`Make`/`AddRoot`/`RemoveRoot`/`Collect`, `Collect()` holding the lock
+for its entire mark-sweep pass, `Persistent<T>`'s every mutator taking
+the lock for its whole detach+reassign+attach sequence (not two
+separate acquisitions) so a concurrent `Collect()` can never observe a
+root mid-update.
+
+That locking alone was not sufficient. A real multi-threaded stress
+test (`tests/sync/sync_stress_test.cc`, new -- 8 producer/4 consumer
+threads hammering a `Chan` via `try_send`/`try_recv`, 8 threads doing
+concurrent `Make`+`Persistent`+`Collect`, 8 threads hammering the
+`Map` guard's atomic flag) found `Chan` and the `Map` detector
+genuinely solid (160,000 real items with matching sums; 1.6M
+contention attempts correctly detected) but the GC heap crashed
+roughly 1 run in 8-15 at real scale (8 threads x 5000 allocations,
+`Collect()` running while other threads actively allocate). Root-caused
+via `gdb` across a sequence of narrowing repros (a fully standalone
+reproduction using plain classes with no dependency on any real
+`gc::`/`Persistent` code reproduced the identical crash, ruling out
+anything specific to this project's templates or inheritance depth;
+the crash only appeared once a virtual dispatch was added to the mark
+loop, which turned out to matter only because it widens the timing
+window, not because virtual calls are special): **`Heap::Make<T>()`
+publishes its result into `objects_` -- visible to *any* thread's
+`Collect()` -- before the caller has any chance to root it.** In the
+original single-cooperative-thread model this window was categorically
+unreachable (nothing else could ever run between `Make()` returning and
+the caller rooting its result), so the bug is genuinely new to real
+concurrency, not a pre-existing latent one exposed by testing harder.
+A concurrent `Collect()` on another thread can legitimately see the
+freshly-made object as unreached-from-any-root during that window and
+sweep it, hanging the allocating thread a dangling pointer the instant
+it tries to root or use it -- exactly the "vtable for the wrong type"
+symptom `gdb` showed, from memory freed out from under a still-in-use
+pointer and reused for something else.
+
+Fixed with `Heap::MakeRooted<T>()`: allocates and roots in the SAME
+critical section (a new private `Persistent<T>(T*, AlreadyLockedTag)`
+constructor, `friend`ed to `Heap`, that skips `Persistent`'s own
+locking since the caller -- `MakeRooted` -- already holds it), so
+there is now no instant where an object exists in `objects_` without
+also already being reachable through the `Persistent<T>` handed back.
+`gocvm::RegisterThread()` (the one production caller of the old
+`Make<T>()`-then-root-separately shape) switched to it; `Make()` itself
+is kept, with the hazard documented prominently on it, for the
+single-scheduler-thread case where the window can't be hit -- not
+removed, since removing it would be scope creep on top of prerequisite
+work nothing yet exploits. Verified: the exact 8-thread/5000-allocation
+scenario that reproduced the crash ~1 run in 8-15 went to 30/30 clean
+after the fix, then 10/10 on the full three-part stress test.
+
+Full `ctest` both repos (279 = the existing 278 + the new
+`sync_stress_test`): 279/279. `runtime_smoketest` reconfirmed with real
+asserts (no `-DNDEBUG`) at both `-O0` and `-O2`, repeated runs, clean.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
