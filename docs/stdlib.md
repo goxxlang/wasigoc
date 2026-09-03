@@ -6,8 +6,8 @@ builtins unless the package must touch WASI or the Rosetta runtime (`os`
 fds, `time.Now`). One thread / no growable stacks still applies.
 
 **Status:** 4 builtins + 146 compiled packages. Everyday ported Go++
-source compiles. Packages that cannot exist on wasm32-wasip1 are
-honest stubs or marked n/a, not fake implementations.
+source compiles. A package that can't exist on wasm32-wasip1 returns a
+clear "not supported" error or is marked n/a — it never fakes success.
 
 Per-package notes, bounds, and the compiler bugs each package
 surfaced: [design-log.md](design-log.md) (tracker from
