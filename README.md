@@ -63,7 +63,7 @@ Compile `hello_gen.cpp` with wasi-sdk's **triple wrapper** and the noeh include 
 * **Standard Library:** Four builtins (`fmt`, `errors`, `os`, `reflect`) plus **146** compiled packages under `stdlib/` — matching public `go list std` minus `internal/`/`vendor/` and target-impossible APIs.
 * **Concurrency:** Cooperative `go` / `chan` / `select` powered by C++20 coroutines.
 * **Codecs & Hashes:** Real codecs and hashes (`flate`/`gzip`/`zlib`/`bzip2`/`lzw`, `PNG`/`JPEG`/`GIF`, `SHA-2`/`3`, `AES-128`, `P-256`, `Ed25519`, …) with documented bounds.
-* **Syscall Handling:** Honest stubs where WASI preview 1 has no syscalls (`os/exec`, `net.Dial`; `net.Pipe()` is real and is what [shim_sandbox](https://github.com/goxxlang/shim_sandbox) speaks).
+* **Syscall Handling:** GocVM hanfles (`os/exec`, `net.Dial`; `net.Pipe()` and uses [shim_sandbox](https://github.com/goxxlang/shim_sandbox)).
 
 Language surface and Rosetta table: [docs/language.md](docs/language.md).
 
