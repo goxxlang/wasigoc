@@ -2053,12 +2053,177 @@ struct TaskT {
   T await_resume() { return std::move(h.promise().value); }
 };
 
+// ---- gocvm async dispatch: suspend the caller, not the process --------------
+// gocvm::Call above blocks the ENTIRE cooperative scheduler for as long as
+// HostBridge::Call takes -- there are no OS threads backing it, so one
+// goroutine's slow (or indefinitely blocking, e.g. a socket recv() with
+// no data yet) host call stalls every other ready goroutine too. That was
+// an acceptable v0 shape for calls that are genuinely fast/bounded
+// (getpid, getenv, chdir), but is a real correctness problem for anything
+// that can block indefinitely.
+//
+// gocvm::CallAsync (co_await'd, see below) fixes this: it submits the
+// request to an AsyncHostBridge -- non-blocking by contract, so a real
+// implementation (shim_sandbox's) hands the actual blocking syscall to a
+// worker thread pool and returns immediately -- then suspends only the
+// CALLING coroutine, letting Scheduler::run() keep servicing every other
+// ready goroutine while the host call is in flight. Each pending call
+// gets a real, live VThread (gocvm::RegisterThread(), same registry every
+// go()-spawned goroutine already uses) with State::kAwaitingHost for as
+// long as it's outstanding -- not the "not currently live" placeholder
+// the original VThread comment described, an actual scheduling input:
+// Scheduler::run() below treats a nonempty pending-async set exactly
+// like Chan's own `parked` counter -- proof the program can still make
+// progress, not a deadlock -- and, when there is truly nothing else
+// runnable, blocks on the bridge for a completion instead of panicking
+// or busy-spinning.
+namespace gocvm {
+
+class AsyncHostBridge {
+ public:
+  virtual ~AsyncHostBridge() = default;
+  struct Completion {
+    uint64_t id = 0;
+    std::string reply;
+    std::string err;
+    bool ok = false;
+  };
+  // Non-blocking. Returns an opaque, nonzero request id.
+  virtual uint64_t Submit(const std::string& topic, const std::string& payload) = 0;
+  // Non-blocking: true and fills *out if a completed request is ready,
+  // false immediately otherwise. Scheduler::run() calls this after every
+  // resume to drain whatever finished without making anyone wait.
+  virtual bool PollOne(Completion* out) = 0;
+  // Blocks until at least one request completes (or the bridge itself is
+  // torn down) and fills *out. Only called when Scheduler::run() has
+  // nothing else runnable -- blocking the single cooperative thread here
+  // is exactly as safe as blocking gocvm::Call always was, and strictly
+  // better: every OTHER already-ready goroutine has already run first.
+  virtual void WaitOne(Completion* out) = 0;
+};
+
+namespace detail {
+inline AsyncHostBridge*& async_bridge_slot() {
+  static AsyncHostBridge* b = nullptr;
+  return b;
+}
+
+struct PendingAsyncCall {
+  std::coroutine_handle<> handle;
+  gc::Persistent<VThread> vthread;
+};
+
+inline std::unordered_map<uint64_t, PendingAsyncCall>& pending_async_calls() {
+  static std::unordered_map<uint64_t, PendingAsyncCall> m;
+  return m;
+}
+// Completed-but-not-yet-resumed replies, keyed by request id -- separate
+// from PendingAsyncCall so a completion arriving via WaitOne/PollOne can
+// be stashed and matched up with its awaiter's await_resume() even
+// though the two happen at different points in the scheduler loop.
+inline std::unordered_map<uint64_t, AsyncHostBridge::Completion>& async_results() {
+  static std::unordered_map<uint64_t, AsyncHostBridge::Completion> m;
+  return m;
+}
+
+inline bool has_pending_async() { return !pending_async_calls().empty(); }
+
+// Applies one completion: stash the result, wake the waiting coroutine,
+// clear its VThread back to kRunning. Shared by the non-blocking drain
+// and the blocking wait below.
+inline void apply_completion(const AsyncHostBridge::Completion& c) {
+  auto it = pending_async_calls().find(c.id);
+  if (it == pending_async_calls().end()) return;  // stale/unknown id
+  it->second.vthread->state = VThread::State::kRunning;
+  async_results()[c.id] = c;
+  scheduler().enqueue(it->second.handle);
+  pending_async_calls().erase(it);
+}
+
+// Non-blocking: drain and apply every completion currently available.
+inline void drain_async_completions() {
+  if (!async_bridge_slot()) return;
+  AsyncHostBridge::Completion c;
+  while (async_bridge_slot()->PollOne(&c)) apply_completion(c);
+}
+
+// Blocking: used only when Scheduler::run() has an empty ready queue but
+// pending async work -- there is nothing else this thread could usefully
+// do anyway.
+inline void block_until_async_completion() {
+  AsyncHostBridge::Completion c;
+  async_bridge_slot()->WaitOne(&c);
+  apply_completion(c);
+}
+}  // namespace detail
+
+inline void RegisterAsyncHostBridge(AsyncHostBridge* b) { detail::async_bridge_slot() = b; }
+
+struct CallAsyncAwaiter {
+  std::string topic;
+  std::string payload;
+  // Set up front by CallAsync() below, before any suspension: both are
+  // synchronous, non-blocking checks (same as gocvm::Call's own), so
+  // there's no reason to make every caller suspend just to find out
+  // there's no bridge or ABAC said no.
+  bool immediate = false;
+  CallResult immediate_result;
+  uint64_t request_id = 0;
+
+  bool await_ready() const noexcept { return immediate; }
+  bool await_suspend(std::coroutine_handle<> h) {
+    request_id = detail::async_bridge_slot()->Submit(topic, payload);
+    auto& pc = detail::pending_async_calls()[request_id];
+    pc.handle = h;
+    pc.vthread = gocvm::RegisterThread();
+    pc.vthread->state = VThread::State::kAwaitingHost;
+    return true;
+  }
+  CallResult await_resume() {
+    if (immediate) return std::move(immediate_result);
+    auto it = detail::async_results().find(request_id);
+    // apply_completion() always populates this before re-enqueueing the
+    // handle await_resume() is running on -- absence here would be a
+    // scheduler bug, not a caller-reachable condition.
+    auto c = std::move(it->second);
+    detail::async_results().erase(it);
+    if (!c.ok) return {std::string(), Error("gocvm: " + topic + ": " + c.err)};
+    return {std::move(c.reply), Error()};
+  }
+};
+
+// co_await gocvm::CallAsync(topic, payload) -- the non-blocking sibling
+// of gocvm::Call. Same ABAC-deny / no-bridge shape (surfaced through
+// await_resume() as the identical wasigo::Error text), but a real
+// dispatch suspends the calling goroutine instead of the whole process.
+inline CallAsyncAwaiter CallAsync(const std::string& topic, const std::string& payload) {
+  CallAsyncAwaiter a{topic, payload, false, CallResult{}, 0};
+  if (detail::abac_slot() && !detail::abac_slot()->Check(topic)) {
+    a.immediate = true;
+    a.immediate_result = {std::string(), Error("gocvm: " + topic + ": abac deny")};
+  } else if (!detail::async_bridge_slot()) {
+    a.immediate = true;
+    a.immediate_result = {std::string(), Error("gocvm: " + topic + ": " + std::string(kNoBridge))};
+  }
+  return a;
+}
+
+}  // namespace gocvm
+
 inline void Scheduler::run() {
-  while (!ready.empty()) {
-    auto h = ready.front();
-    ready.pop_front();
-    h.resume();
-    if (h.done()) h.destroy();
+  for (;;) {
+    while (!ready.empty()) {
+      auto h = ready.front();
+      ready.pop_front();
+      h.resume();
+      if (h.done()) h.destroy();
+      gocvm::detail::drain_async_completions();
+    }
+    if (gocvm::detail::has_pending_async()) {
+      gocvm::detail::block_until_async_completion();
+      continue;
+    }
+    break;
   }
   if (parked > 0) panic("fatal error: all goroutines are asleep - deadlock!");
 }

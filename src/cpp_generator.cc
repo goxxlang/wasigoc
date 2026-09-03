@@ -1134,6 +1134,17 @@ class Generator {
               IsAsyncFree(sel->strval)) {
             return true;
           }
+          // gocvm.Call is the one builtin async dispatch point (see
+          // gocvm::CallAsync in runtime.hpp): it's not a parsed .go
+          // FuncDecl at all, so IsAsyncFree/IsImportedPackage above
+          // (which only know about real stdlib/user source) never see
+          // it -- special-cased here the same way ExprKind::Recv is,
+          // as an inherent await point rather than something inferred
+          // from a callee's own body.
+          if (sel->x && sel->x->kind == ExprKind::Ident && PkgOf(sel->x->strval) == "gocvm" &&
+              sel->strval == "Call") {
+            return true;
+          }
           for (auto& k : async_methods_) {
             if (k.size() > sel->strval.size() + 1 &&
                 k.compare(k.size() - sel->strval.size(), sel->strval.size(), sel->strval) == 0 &&
@@ -3155,9 +3166,14 @@ class Generator {
       }
       if (sel->x->kind == ExprKind::Ident && PkgOf(sel->x->strval) == "gocvm") {
         if (sel->strval == "Call") {
+          // ExprNeedsAwait above always makes any function calling this
+          // async, so this is unconditionally a coroutine context --
+          // gocvm::CallAsync suspends the calling goroutine instead of
+          // blocking the whole cooperative scheduler for the call's
+          // duration (see the doc comment on it in runtime.hpp).
           const FuncDecl* f = LookupFreeFunc(sel->strval, "gocvm");
           std::string args = EmitArgsFor(f->params, e.args);
-          return "wasigo::gocvm::Call(" + args + ")";
+          return "co_await wasigo::gocvm::CallAsync(" + args + ")";
         }
         Error("unsupported gocvm function '" + sel->strval + "' (Call)");
       }

@@ -232,6 +232,68 @@ static void gocvm_error_state() {
   gocvm::RegisterHostBridge(nullptr);
 }
 
+// -- gocvm::CallAsync: suspends the caller, not the whole scheduler -------
+// A fake AsyncHostBridge that only ever answers from WaitOne (never
+// PollOne) -- meaning a pending request completes at the exact moment,
+// and only the exact moment, Scheduler::run() has nothing else runnable
+// and must block. If CallAsync's suspend/resume plumbing is broken and
+// it silently reverts to blocking-the-caller-synchronously behavior,
+// this bridge would never even get asked (Submit's caller wouldn't
+// return control to the scheduler at all) and the ordering assertion
+// below would fail.
+struct FakeAsyncBridge : gocvm::AsyncHostBridge {
+  std::vector<uint64_t> pending;
+  uint64_t next_id = 1;
+
+  uint64_t Submit(const std::string&, const std::string&) override {
+    uint64_t id = next_id++;
+    pending.push_back(id);
+    return id;
+  }
+  bool PollOne(Completion*) override { return false; }
+  void WaitOne(Completion* out) override {
+    assert(!pending.empty());
+    out->id = pending.front();
+    pending.erase(pending.begin());
+    out->ok = true;
+    out->reply = "done:" + std::to_string(out->id);
+  }
+};
+
+static Task async_probe(std::string* order) {
+  auto r = co_await gocvm::CallAsync("test.topic", "payload");
+  assert(r.r1 == nullptr);
+  assert(r.r0 == "done:1");
+  *order += "A";
+  co_return;
+}
+
+static Task marker_task(std::string* order) {
+  *order += "B";
+  co_return;
+}
+
+static void gocvm_async_ordering() {
+  FakeAsyncBridge fake;
+  gocvm::RegisterAsyncHostBridge(&fake);
+  std::string order;
+
+  // Both spawned before run() ever executes, so the ready queue holds
+  // [A, B] in that order. A resumes first, hits CallAsync, suspends
+  // (its VThread goes kAwaitingHost) -- if that suspension is real, B is
+  // STILL next in the ready queue and runs to completion before A's
+  // request is ever answered (FakeAsyncBridge only answers from
+  // Scheduler::run()'s blocking WaitOne, called only once the ready
+  // queue is otherwise empty). "BA", not "AB", is the actual proof.
+  go(async_probe(&order));
+  go(marker_task(&order));
+  run();
+
+  assert(order == "BA");
+  assert(fake.pending.empty());
+  gocvm::RegisterAsyncHostBridge(nullptr);
+}
+
 int main() {
   auto s = Slice<int64_t>{1, 2, 3};
   assert(len(s) == 3);
@@ -327,5 +389,6 @@ int main() {
   run(returning_task());
 
   gocvm_error_state();
+  gocvm_async_ordering();
   return 0;
 }
