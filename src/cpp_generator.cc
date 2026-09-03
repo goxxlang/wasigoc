@@ -2401,9 +2401,43 @@ class Generator {
   }
 
   std::string EmitIndex(const Expr& e) {
-    auto baseType = ResolveUnderlying(InferType(e.x.get()));
+    auto exprType = InferType(e.x.get());
+    auto baseType = ResolveUnderlying(exprType);
     std::string base = EmitExpr(*e.x);
     std::string idx = EmitExpr(*e.y);
+    // A named type wrapping []T/[N]T/map[K]V *with at least one method*
+    // (EmitAliases' wrapper-struct path -- HasMethodsOn is the exact
+    // same predicate EmitAliases itself uses to choose that path) only
+    // exposes an implicit conversion to the underlying Slice<T>/
+    // array/Map<K,V> -- operator[] isn't found through that via
+    // ordinary overload resolution (unlike arithmetic/comparison
+    // operators, operator[] specifically isn't part of the "surrogate"
+    // built-in candidate set C++ generates from a class's own
+    // conversion functions). Index through the wrapper's own `v`
+    // member directly (EmitAliases always names it exactly that, and
+    // it's a plain public field) rather than through the conversion
+    // operator: the conversion operator returns by VALUE, so casting
+    // through it would index a throwaway COPY, silently discarding any
+    // write (`x[0] = 5` on a std::array-backed wrapper would write into
+    // the copy and vanish -- a real regression this exact shape caught
+    // when the fix first went through the conversion operator instead
+    // of `.v`, on Slice<T>'s to-be-fair-usually-harmless shared_ptr
+    // backing, then again on the plain-array case below). `.v` is a
+    // real reference into the actual storage either way.
+    //
+    // Gating on HasMethodsOn specifically (not just "is a Named type")
+    // also matters on its own: a plain no-method named type (`type
+    // Block [64]int32`) is ALSO reported as TypeKind::Named by
+    // InferType, but EmitAliases compiles it to a transparent `using
+    // Block = std::array<...>;` with no wrapper struct and no `.v`
+    // field at all -- exprType and baseType already agree there, base
+    // already IS a real std::array/Slice/Map with a real operator[].
+    bool named_container_wrapper =
+        exprType && exprType->kind == TypeKind::Named && baseType &&
+        (baseType->kind == TypeKind::Slice || baseType->kind == TypeKind::Array ||
+         baseType->kind == TypeKind::Map) &&
+        HasMethodsOn(exprType->name, exprType->pkg);
+    if (named_container_wrapper) base = "(" + base + ").v";
     if (baseType && baseType->kind == TypeKind::Map) {
       return "(" + base + ")[" + idx + "]";
     }
@@ -4548,9 +4582,25 @@ class Generator {
   }
 
   void EmitForRange(const Stmt& s) {
-    auto baseType = ResolveUnderlying(InferType(s.range_expr.get()));
+    auto exprType = InferType(s.range_expr.get());
+    auto baseType = ResolveUnderlying(exprType);
     if (!baseType) Error("cannot resolve the type of a 'range' expression");
     std::string range_src = EmitExpr(*s.range_expr);
+    // A named type wrapping []T/[N]T/map[K]V *with at least one method*
+    // (EmitAliases' wrapper-struct path, gated by HasMethodsOn exactly
+    // like EmitIndex's matching fix -- see its longer comment for why
+    // that gate matters and why `.v` beats casting through the
+    // conversion operator) only exposes an implicit conversion to the
+    // underlying Slice<T>/array/Map<K,V> -- ranging needs
+    // .size()/operator[]/begin()/end() directly on range_src below,
+    // none of which are found through that conversion via ordinary
+    // lookup. Range over the wrapper's own `v` member directly instead.
+    if (exprType && exprType->kind == TypeKind::Named &&
+        (baseType->kind == TypeKind::Slice || baseType->kind == TypeKind::Array ||
+         baseType->kind == TypeKind::Map) &&
+        HasMethodsOn(exprType->name, exprType->pkg)) {
+      range_src = "(" + range_src + ").v";
+    }
     if (baseType->kind == TypeKind::Pointer) {
       auto elem = ResolveUnderlying(baseType->elem.get());
       if (elem && elem->kind == TypeKind::Array) {
@@ -4622,7 +4672,7 @@ class Generator {
       out_ << Indent() << "}\n";
     } else if (baseType->kind == TypeKind::Map) {
       std::string pv = "__p" + std::to_string(temp_id_++);
-      out_ << Indent() << "for (auto& " << pv << " : " << EmitExpr(*s.range_expr) << ") {\n";
+      out_ << Indent() << "for (auto& " << pv << " : " << range_src << ") {\n";
       indent_++;
       if (s.range_has_key) {
         out_ << Indent() << "auto& " << s.names[0] << " = " << pv << ".first;\n";
@@ -4996,8 +5046,22 @@ class Generator {
   // Embedded/anonymous fields are skipped (their promoted-field shape
   // isn't reflected through here).
   void EmitReflectDescribe(const StructDecl& sd) {
-    if (!sd.type_params.empty()) return;
     std::string self_type = SelfTypeName(sd);
+    // Generic struct (`type Pair[T any] struct {...}`): SelfTypeName
+    // already yields the instantiated-looking form ("Pair<T>") used
+    // inside the struct's own template body, so both free functions
+    // below just need to become templates over the SAME type
+    // parameters -- has_reflect_describe/has_reflect_typename
+    // (runtime.hpp) find them via ADL + template argument deduction
+    // exactly like any other ADL-found overload; nothing there needs
+    // to change. This used to just `return` here instead, silently
+    // leaving Pair[int]{...} (or any other generic struct) with no
+    // reflection metadata at all -- reflect.TypeOf/.NumField/.Field
+    // would see it as an opaque non-struct rather than erroring
+    // loudly, since has_reflect_describe<T> is a compile-time trait: a
+    // missing overload just makes the reflect.Value branch that checks
+    // it silently take the "not a struct" path.
+    std::string tmpl_prefix = TemplatePrefixFrom(sd.type_params);
     // "outFields", not "__out": a leading-double-underscore identifier is
     // reserved to the implementation anyway, and "__out" specifically
     // collides with a legacy Windows SDK SAL annotation macro (from
@@ -5006,6 +5070,7 @@ class Generator {
     // MSVC then reports nonsensical "syntax error '.'" at every later use
     // of the (macro-expanded-away) parameter, not at the macro site
     // itself, which made this one take a moment to place.
+    out_ << tmpl_prefix;
     out_ << "inline void wasigo_reflect_describe(" << self_type
          << "* __v, std::vector<wasigo::FieldInfo>& outFields) {\n";
     for (auto& f : sd.fields) {
@@ -5024,6 +5089,7 @@ class Generator {
       }
     }
     out_ << "}\n";
+    out_ << tmpl_prefix;
     out_ << "inline const char* wasigo_reflect_typename(const " << self_type << "*) { return \""
          << (file_.package_name.empty() || file_.package_name == "main" ? sd.name
                                                                           : file_.package_name + "." + sd.name)
@@ -5265,16 +5331,60 @@ class Generator {
         out_ << "  constexpr " << a.name << "() = default;\n";
         out_ << "  constexpr " << a.name << "(" << under << " x) : v(x) {}\n";
         out_ << "  constexpr operator " << under << "() const { return v; }\n";
+        // reflect.TypeOf(...).Kind() -- has_reflect_kind_override in
+        // runtime.hpp reads this back. A defined type with methods
+        // wrapping []T/[N]T/map[K]V is the only case that gets a real,
+        // distinct wrapper struct to hang this on (see the comment
+        // there); a plain named type with no underlying container kind
+        // (`type Celsius float64`) has nothing more specific than the
+        // underlying's own Kind to report, so no override is emitted
+        // and kind_of<T> falls through to that below as before.
+        const TypeNode* under_resolved = ResolveUnderlying(a.type.get());
+        if (under_resolved && (under_resolved->kind == TypeKind::Slice ||
+                                under_resolved->kind == TypeKind::Array ||
+                                under_resolved->kind == TypeKind::Map)) {
+          const char* rk = under_resolved->kind == TypeKind::Slice   ? "Slice"
+                            : under_resolved->kind == TypeKind::Array ? "Array"
+                                                                       : "Map";
+          out_ << "  static constexpr int wasigo_reflect_kind = static_cast<int>(wasigo::RKind::"
+               << rk << ");\n";
+        }
         for (auto& fn : file_.funcs) {
           if (fn.has_receiver && fn.receiver_type == a.name) EmitMethodDecl(fn);
         }
         out_ << "};\n";
+        // reflect.TypeOf(...).Name() -- same has_reflect_typename ADL
+        // trait EmitReflectDescribe wires up for ordinary structs;
+        // this wrapper struct never went through that path at all
+        // before, so Name() silently came back "" for every defined
+        // type with methods, not just container-underlying ones.
+        out_ << "inline const char* wasigo_reflect_typename(const " << SelfTypeNameForAlias(a)
+             << "*) { return \""
+             << (file_.package_name.empty() || file_.package_name == "main"
+                     ? a.name
+                     : file_.package_name + "." + a.name)
+             << "\"; }\n";
       } else {
         out_ << "using " << a.name << " = " << CppType(a.type.get()) << ";\n";
       }
     }
     current_type_params_ = saved_tp;
     if (!file_.aliases.empty()) out_ << "\n";
+  }
+
+  // Same shape as SelfTypeName(const StructDecl&) but for a defined-
+  // type alias's own wrapper struct (TypeAlias has no such helper yet).
+  std::string SelfTypeNameForAlias(const TypeAlias& a) const {
+    std::string n = a.name;
+    if (!a.type_params.empty()) {
+      n += "<";
+      for (size_t i = 0; i < a.type_params.size(); ++i) {
+        if (i) n += ", ";
+        n += a.type_params[i];
+      }
+      n += ">";
+    }
+    return n;
   }
 
   void EmitPackageInit() {

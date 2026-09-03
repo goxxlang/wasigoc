@@ -599,6 +599,16 @@ enum class RKind : int {
   Slice,
   Complex64,
   Complex128,
+  // Appended, not inserted -- real Go's own reflect.Kind numbering has
+  // Array/Map between Int64...Complex128 alphabetically-ish, but this
+  // enum's existing values are already load-bearing (matched by
+  // position against stdlib/reflect's Go-visible constants, see
+  // IsReflectKindName in cpp_generator.cc) so renumbering anything
+  // above would be a silent, wide-reaching break. Named array/map
+  // types with methods (EmitAliases' wrapper-struct path) are the only
+  // thing that ever produces these -- see kind_of<T>() below.
+  Array,
+  Map,
 };
 
 struct FieldInfo;  // defined after Any -- see the forward-declaration note below
@@ -623,6 +633,22 @@ template <class T>
 struct has_reflect_typename<T, std::void_t<decltype(wasigo_reflect_typename(std::declval<const T*>()))>>
     : std::true_type {};
 
+// A named type wrapping []T/[N]T/map[K]V with at least one method
+// (`type IntList []int; func (l IntList) Sum() int {...}`) compiles to
+// a real wrapper struct (EmitAliases in cpp_generator.cc), not a
+// transparent `using` alias -- so unlike a bare Slice<T>/Map<K,V>
+// value, it has an actual C++ type of its own for kind_of<T> to
+// classify correctly instead of falling through to Invalid. EmitAliases
+// emits `static constexpr int wasigo_reflect_kind = ...;` on that
+// wrapper struct specifically when its underlying kind is
+// Slice/Array/Map; this trait detects that member via ADL-free direct
+// lookup (a static data member, not a free function, so no ADL needed)
+// so kind_of<T> can read it back.
+template <class T, class = void>
+struct has_reflect_kind_override : std::false_type {};
+template <class T>
+struct has_reflect_kind_override<T, std::void_t<decltype(T::wasigo_reflect_kind)>> : std::true_type {};
+
 template <class T>
 constexpr int kind_of() {
   if constexpr (std::is_same_v<T, bool>) return static_cast<int>(RKind::Bool);
@@ -640,14 +666,21 @@ constexpr int kind_of() {
   else if constexpr (std::is_same_v<T, Complex128>) return static_cast<int>(RKind::Complex128);
   else if constexpr (std::is_same_v<T, std::string>) return static_cast<int>(RKind::String);
   else if constexpr (std::is_pointer_v<T>) return static_cast<int>(RKind::Ptr);
+  else if constexpr (has_reflect_kind_override<T>::value) return T::wasigo_reflect_kind;
   else if constexpr (has_reflect_describe<T>::value) return static_cast<int>(RKind::Struct);
-  // Slice/Map/Chan/Func/Interface kinds aren't classified (report
-  // Invalid) -- reflecting *into* a slice/map's elements would need its
-  // own len/index metadata this compiler doesn't generate yet; struct
-  // field reflection (the motivating use case, arbitrary-struct JSON
+  // A bare (unnamed, or named-without-methods -- EmitAliases makes
+  // those a transparent `using` alias, so there's no distinct T to
+  // classify anyway) Slice<T>/Map<K,V>/Chan<T>/Func<...>/interface
+  // isn't classified here (reports Invalid) -- reflecting *into* a
+  // slice/map's elements would need its own len/index metadata this
+  // compiler doesn't generate for the ANONYMOUS case; struct field
+  // reflection (the motivating use case, arbitrary-struct JSON
   // marshaling) doesn't need it for the field's own Kind, only for a
   // slice/map-*typed* field's Kind, which callers should treat as a
-  // known gap rather than a wrong answer.
+  // known gap rather than a wrong answer. A NAMED slice/array/map type
+  // with methods gets a real Kind above instead, via
+  // has_reflect_kind_override -- it has an actual distinct C++ type
+  // (the wrapper struct) to hang that classification on.
   else return static_cast<int>(RKind::Invalid);
 }
 
