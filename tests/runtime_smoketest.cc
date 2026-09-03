@@ -4,7 +4,11 @@
 #include "runtime.hpp"
 
 #include <cassert>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 
 using namespace wasigo;
 
@@ -294,6 +298,109 @@ static void gocvm_async_ordering() {
   gocvm::RegisterAsyncHostBridge(nullptr);
 }
 
+// -- VThread -> real OS thread mapping ------------------------------------
+// A fake bridge with a REAL worker thread (unlike FakeAsyncBridge above,
+// which answers synchronously from the scheduler thread inside
+// WaitOne) -- the only way to prove gocvm::OSThreadFor/VThread::os_thread
+// name an actually-different OS thread, not just record whatever
+// thread happened to call apply_completion().
+struct ThreadedFakeAsyncBridge : gocvm::AsyncHostBridge {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<uint64_t> jobs;
+  std::deque<Completion> results;
+  bool shutdown = false;
+  uint64_t next_id = 1;
+  std::thread worker;
+
+  ThreadedFakeAsyncBridge() : worker(&ThreadedFakeAsyncBridge::Loop, this) {}
+  ~ThreadedFakeAsyncBridge() override {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      shutdown = true;
+    }
+    cv.notify_all();
+    worker.join();
+  }
+  ThreadedFakeAsyncBridge(const ThreadedFakeAsyncBridge&) = delete;
+
+  uint64_t Submit(const std::string&, const std::string&) override {
+    std::lock_guard<std::mutex> lk(mu);
+    uint64_t id = next_id++;
+    jobs.push_back(id);
+    cv.notify_one();
+    return id;
+  }
+  bool PollOne(Completion* out) override {
+    std::lock_guard<std::mutex> lk(mu);
+    if (results.empty()) return false;
+    *out = results.front();
+    results.pop_front();
+    return true;
+  }
+  void WaitOne(Completion* out) override {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [&] { return !results.empty(); });
+    *out = results.front();
+    results.pop_front();
+  }
+  void Loop() {
+    for (;;) {
+      uint64_t id;
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return shutdown || !jobs.empty(); });
+        if (jobs.empty()) {
+          if (shutdown) return;
+          continue;
+        }
+        id = jobs.front();
+        jobs.pop_front();
+      }
+      Completion c;
+      c.id = id;
+      c.ok = true;
+      c.reply = "threaded:" + std::to_string(id);
+      c.worker_thread = std::this_thread::get_id();
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        results.push_back(c);
+      }
+      cv.notify_one();
+    }
+  }
+};
+
+static Task os_thread_probe(uint64_t* vid_out) {
+  // Named awaiter, not `co_await gocvm::CallAsync(...)` inline, so the
+  // test can read vthread_id back afterward -- generated code never
+  // needs this, only introspection like this test.
+  auto awaiter = gocvm::CallAsync("test.os_thread", "x");
+  auto r = co_await awaiter;
+  assert(r.r1 == nullptr);
+  assert(r.r0 == "threaded:1");
+  *vid_out = awaiter.vthread_id;
+  co_return;
+}
+
+static void gocvm_vthread_maps_to_real_os_thread() {
+  ThreadedFakeAsyncBridge bridge;
+  gocvm::RegisterAsyncHostBridge(&bridge);
+  std::thread::id main_id = std::this_thread::get_id();
+
+  uint64_t vid = 0;
+  run(os_thread_probe(&vid));
+
+  assert(vid != 0);
+  auto served_by = gocvm::OSThreadFor(vid);
+  assert(served_by.has_value());
+  assert(*served_by != std::thread::id());  // a real thread, not "none yet"
+  assert(*served_by != main_id);            // genuinely a DIFFERENT OS thread
+  assert(*served_by == bridge.worker.get_id());  // and specifically THAT one
+
+  gocvm::RegisterAsyncHostBridge(nullptr);
+}
+
 int main() {
   auto s = Slice<int64_t>{1, 2, 3};
   assert(len(s) == 3);
@@ -390,5 +497,6 @@ int main() {
 
   gocvm_error_state();
   gocvm_async_ordering();
+  gocvm_vthread_maps_to_real_os_thread();
   return 0;
 }

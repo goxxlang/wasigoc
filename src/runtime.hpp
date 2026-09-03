@@ -74,6 +74,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -1827,10 +1828,21 @@ inline void RegisterAbacHook(AbacHook* a) { detail::abac_slot() = a; }
 struct VThread : gc::GarbageCollected<VThread> {
   enum class State { kRunning, kAwaitingHost };
   uint64_t id = 0;
-  // v0's Call() below is synchronous (no suspension point), so nothing
-  // transitions this yet -- it's here so a future suspending dispatch
-  // doesn't need a VThread redesign, not a currently-live state machine.
+  // Live again as of CallAsync (see below): kAwaitingHost for exactly
+  // the span between await_suspend() submitting a request and
+  // apply_completion() waking the coroutine back up.
   State state = State::kRunning;
+  // The real OS thread that served this VThread's most recent gocvm
+  // async host call, if any has ever completed -- set by
+  // apply_completion() below, once, right as the call finishes (not
+  // continuously live while kAwaitingHost: the in-flight worker-thread
+  // identity isn't something the caller can safely read concurrently
+  // without its own synchronization, but the completed-call record is
+  // stable once written). std::thread::id() (its default, comparable
+  // via ==) means "no async call has completed yet". See also
+  // gocvm::OSThreadFor(id) below, which looks this same fact up by raw
+  // numeric id without needing the VThread pointer.
+  std::thread::id os_thread{};
   void Trace(gc::Visitor&) const override {}
 };
 
@@ -2277,6 +2289,15 @@ class AsyncHostBridge {
     std::string reply;
     std::string err;
     bool ok = false;
+    // Which real OS thread actually ran this call -- a real
+    // AsyncHostBridge implementation (shim_sandbox's AsyncSapiBridge)
+    // sets this via std::this_thread::get_id() from inside its worker
+    // thread(s) before handing the completion back. Default
+    // std::thread::id() ("no thread") for a bridge that never sets it
+    // (e.g. a synchronous test fake answering from the calling thread
+    // itself) -- apply_completion() below only records a mapping for a
+    // non-default id.
+    std::thread::id worker_thread{};
   };
   // Non-blocking. Returns an opaque, nonzero request id.
   virtual uint64_t Submit(const std::string& topic, const std::string& payload) = 0;
@@ -2318,12 +2339,37 @@ inline std::unordered_map<uint64_t, AsyncHostBridge::Completion>& async_results(
 
 inline bool has_pending_async() { return !pending_async_calls().empty(); }
 
+// VThread id -> the real OS thread that most recently served that
+// virtual thread's gocvm async host call. Keyed by the plain numeric
+// id (not the VThread pointer) so a caller that only has the id --
+// logging, metrics, anything outside the VThread's own owning
+// coroutine -- can still look up which real thread did the work, and
+// so the mapping outlives the VThread itself once it's collected.
+// Mutex-protected the same way everything else shared across threads
+// in this runtime is: apply_completion() below always runs on the
+// scheduler thread, but a future bridge with more than one worker
+// could plausibly want to record straight from a worker thread later.
+inline std::mutex& os_thread_map_mu() {
+  static std::mutex m;
+  return m;
+}
+inline std::unordered_map<uint64_t, std::thread::id>& os_thread_map() {
+  static std::unordered_map<uint64_t, std::thread::id> m;
+  return m;
+}
+
 // Applies one completion: stash the result, wake the waiting coroutine,
-// clear its VThread back to kRunning. Shared by the non-blocking drain
-// and the blocking wait below.
+// record which real OS thread served it, clear its VThread back to
+// kRunning. Shared by the non-blocking drain and the blocking wait
+// below.
 inline void apply_completion(const AsyncHostBridge::Completion& c) {
   auto it = pending_async_calls().find(c.id);
   if (it == pending_async_calls().end()) return;  // stale/unknown id
+  if (c.worker_thread != std::thread::id()) {
+    it->second.vthread->os_thread = c.worker_thread;
+    std::lock_guard<std::mutex> lk(os_thread_map_mu());
+    os_thread_map()[it->second.vthread->id] = c.worker_thread;
+  }
   it->second.vthread->state = VThread::State::kRunning;
   async_results()[c.id] = c;
   scheduler().enqueue(it->second.handle);
@@ -2349,6 +2395,21 @@ inline void block_until_async_completion() {
 
 inline void RegisterAsyncHostBridge(AsyncHostBridge* b) { detail::async_bridge_slot() = b; }
 
+// Maps a VThread (by its plain numeric id -- gocvm::RegisterThread()'s
+// return value's ->id, or VThread::id read off any live VThread) to the
+// real OS thread that most recently served its async host call, if any
+// has ever completed. std::nullopt if `id` is unknown or nothing has
+// completed for it yet (still in flight, or it never made an async
+// call at all). See VThread::os_thread for the same fact when you
+// already hold the VThread pointer instead of just its id.
+inline std::optional<std::thread::id> OSThreadFor(uint64_t vthread_id) {
+  std::lock_guard<std::mutex> lk(detail::os_thread_map_mu());
+  auto& m = detail::os_thread_map();
+  auto it = m.find(vthread_id);
+  if (it == m.end()) return std::nullopt;
+  return it->second;
+}
+
 struct CallAsyncAwaiter {
   std::string topic;
   std::string payload;
@@ -2359,6 +2420,13 @@ struct CallAsyncAwaiter {
   bool immediate = false;
   CallResult immediate_result;
   uint64_t request_id = 0;
+  // The VThread id created for this specific call, once await_suspend
+  // runs (0 for an immediate/no-suspend result). Not needed by
+  // generated code -- gocvm.Call unpacks CallResult only -- but lets a
+  // caller that keeps its own named awaiter (`auto a = CallAsync(...);
+  // r = co_await a;` instead of `co_await CallAsync(...)` inline) look
+  // up gocvm::OSThreadFor(a.vthread_id) afterward.
+  uint64_t vthread_id = 0;
 
   bool await_ready() const noexcept { return immediate; }
   bool await_suspend(std::coroutine_handle<> h) {
@@ -2367,6 +2435,7 @@ struct CallAsyncAwaiter {
     pc.handle = h;
     pc.vthread = gocvm::RegisterThread();
     pc.vthread->state = VThread::State::kAwaitingHost;
+    vthread_id = pc.vthread->id;
     return true;
   }
   CallResult await_resume() {
@@ -2387,7 +2456,7 @@ struct CallAsyncAwaiter {
 // await_resume() as the identical wasigo::Error text), but a real
 // dispatch suspends the calling goroutine instead of the whole process.
 inline CallAsyncAwaiter CallAsync(const std::string& topic, const std::string& payload) {
-  CallAsyncAwaiter a{topic, payload, false, CallResult{}, 0};
+  CallAsyncAwaiter a{topic, payload, false, CallResult{}, 0, 0};
   if (detail::abac_slot() && !detail::abac_slot()->Check(topic)) {
     a.immediate = true;
     a.immediate_result = {std::string(), Error("gocvm: " + topic + ": abac deny")};
@@ -2911,7 +2980,11 @@ class GSelect {
     }
   };
 
-  Awaiter operator co_await() { return Awaiter{std::move(cases)}; }
+  Awaiter operator co_await() {
+    Awaiter a;
+    a.cases = std::move(cases);
+    return a;
+  }
 };
 #endif  // WASIGO_NEED_CORO
 
