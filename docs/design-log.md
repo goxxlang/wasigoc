@@ -1716,6 +1716,71 @@ awaiter (`auto a = CallAsync(...); r = co_await a;`) can look this up
 afterward -- generated code never needs it, only introspection like
 this.
 
+**Same day, last round -- reflect catches up with generic structs and
+named array/slice/map types.** Asked to make `reflect` recognize this
+project's own recent type-system work. Found: `EmitReflectDescribe`
+returned immediately for any struct with type parameters, so a generic
+struct (`Pair[int]{...}`) got zero reflection metadata at all --
+`reflect.TypeOf(p).Name()`/`.NumField()`/`.Field(i)` silently reported
+"not a struct" rather than erroring, since `has_reflect_describe<T>` is
+a compile-time trait and a missing overload just makes the checking
+branch take the false path. Fixed by emitting `wasigo_reflect_describe`/
+`wasigo_reflect_typename` as templates over the struct's own type
+parameters instead of skipping them -- the existing ADL + `void_t`
+trait detection in `runtime.hpp` finds a template overload exactly the
+same way it finds a concrete one, no changes needed there.
+
+A named type wrapping `[]T`/`[N]T`/`map[K]V` with at least one method
+(`type IntList []int; func (l IntList) Sum() int {...}`) never got
+this treatment either -- it goes through a completely separate code
+path (`EmitAliases`' wrapper-struct branch), so `Name()` came back `""`
+for every such type. Fixed the same way, plus a new
+`static constexpr int wasigo_reflect_kind` member (a new
+`has_reflect_kind_override` trait reads it, checked before the
+existing struct check in `kind_of<T>`) so `Kind()` reports the real
+Slice/Array/Map kind instead of falling through to Invalid -- `RKind`
+gained `Array`/`Map` values for this, appended at the very end since
+the existing values are matched by POSITION against `reflect`'s
+Go-visible constants and inserting anywhere else would silently
+renumber everything after it.
+
+Investigating this surfaced two real, more fundamental bugs in the
+same wrapper-struct machinery, independent of `reflect` entirely:
+indexing (`l[0]`) and ranging (`for _, v := range l`) over a named
+slice/array/map type with methods didn't compile at all. The wrapper
+struct only exposes an implicit conversion to the underlying type;
+`operator[]` and range-for's own `.size()`/`begin()`/`end()` lookup
+don't consider a class's conversion operators the way arithmetic/
+comparison operators do, so neither was ever found. First fix attempt
+cast through the conversion operator (`Slice<T>(x)`) to make these
+resolve -- compiled, and worked for the `Slice`-backed case (shared
+storage under a `shared_ptr`, so a copy of the handle still points at
+the same data) -- but a conversion operator returns BY VALUE, and for
+the plain no-method named-array case (`type Block [64]int32`, already
+a transparent `using` alias with no wrapper struct at all, fine before
+touching anything) the fix applied the SAME cast anyway, silently
+writing an indexed assignment into a throwaway copy: `b[0] = 42`
+no-op'd `b`. `typedecl_golden` and `jpegpkg_golden` (named byte arrays
+without methods, used heavily for pixel/DCT data) both caught this
+immediately as a full `ctest` regression -- exactly the methodology
+this diary keeps using, just against this session's own change instead
+of a fresh compile target. Fixed properly by gating on `HasMethodsOn`
+(the exact predicate `EmitAliases` itself uses to pick the wrapper-
+struct path over a transparent alias) and indexing/ranging through the
+wrapper's own `v` member directly instead of the conversion operator --
+a real reference into the actual storage, correct for both the
+`shared_ptr`-backed and value-array-backed cases, verified explicitly
+with a named ARRAY type that has a method (write-through indexing then
+ranging over the same variable), the one case that would have caught
+the copy-vs-reference distinction on its own.
+
+Verified: `reflect.TypeOf`/`NumField`/`Field`/`FieldName` on a real
+`Pair[int]` instance; `Name`/`Kind`/indexing/ranging on a real
+`IntList`; write-through indexing and ranging together on a named
+array type with a method. Full `ctest` (both repos): 279/279, including
+`typedecl_golden`/`jpegpkg_golden` themselves confirming the earlier
+copy-vs-reference regression is gone.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
@@ -1743,7 +1808,8 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `crypto/dsa` | **in** (bounded textbook SignRaw/VerifyRaw with a caller-supplied k, same "no GenerateKey" shape as crypto/rsa. Verified with a tiny p=23/q=11/g=2 vector) |
 | `crypto/ecdh` | **in** (P-256 SharedSecret = x(priv*peer); Alice/Bob symmetry verified with small scalars) |
 | `crypto/ecdsa` | **in** (P-256 SignRaw with caller-supplied k + Verify. Sign/Verify round trip with small d/k/hash) |
-| `crypto/ed25519` | **in** (RFC 8032 Sign/Verify via math/big field arithmetic -- slow, correct. Golden covers sizes and reject-short-sig; a full scalar-mult round trip is too expensive for the decimal-limb Int at this size) |
+| `crypto/ed25519` | **in** (RFC 8032 Sign/Verify via math/big field arithmetic -- slow, correct. `ed25519pkg`'s golden only covers sizes and reject-short-sig, since a full scalar-mult round trip was believed too expensive for the decimal-limb Int at this size -- that belief hid a real bug: the `dEd` twisted-Edwards curve constant had a transcription error in its low digits (`...085989429717` instead of the correct `...085940283555`, i.e. `-121665/121666 mod p`), so the compiled-in base point never actually satisfied the curve equation. `ptAdd`/`scalarMult` were internally self-consistent (Sign and Verify each independently correct relative to the wrong curve), which is exactly why the discrepancy stayed invisible without an external Sign-then-Verify check. Found while building `guac` (below), which needed real signing; fixed by correcting the constant. A genuine full keygen/sign/verify/tamper-reject round trip is now exercised by `guacpkg`'s golden and does complete, just slowly (tens of seconds at `-O2` native; budget accordingly for anything that calls `Sign`/`Verify`/`PublicKey` more than a couple of times) |
+| `guac` (not `go list std` -- project extension) | **in** (`stdlib/guac`: the "unil" bill-of-materials format, a Go++ port of `~/WASMUniLoader/cpp/src/sbom.cc`'s C++ core -- File/Component/Signature/Document, canonical JSON matching that C++ writer byte-for-byte including its partial-indent quirk, SHA-256 digest, Ed25519 sign/verify of documents and detached bytes, JSON parse via `encoding/json`'s generic `map[string]any` tree (its struct-Unmarshal path doesn't walk slice fields, so `Document` is assembled by hand from that tree -- same shape as sbom.cc's own tiny `J` parser), and an `Execute(cmd string)` JSON-in/JSON-out dispatcher mirroring sbom.cc's `execute()` (sandbox/bundle/canonical/digest/sign/verify/keygen/signbytes/verifybytes -- no `embeddedSandbox`, since this package has no baked-in WASMUniLoader wasm hashes to fall back to). Private keys are 64 bytes everywhere (32-byte seed \|\| 32-byte public, matching the C++ core and real Go's own `ed25519.PrivateKey` layout); only the seed half is passed to `ed25519.Sign`. `guacpkg`'s golden is a full round trip: build a sandbox+bundle document, digest it, generate a keypair, sign and verify the document, stringify then re-parse it and verify again, sign and verify detached bytes, and confirm tampered bytes are rejected) |
 | `crypto/elliptic` | **in** (NIST P-256 affine, IsOnCurve/Add/ScalarMult/ScalarBaseMult. G is on the curve; 1*G == G) |
 | `crypto/rand` | **in** (Reader/Read fill from math/rand's time-seeded xorshift -- NOT a CSPRNG, same honest caveat as math/rand. Wiring WASI random_get would need a compiler builtin like time.Now) |
 | `crypto/sha3` | **in** (SHA3-256 only, FIPS 202 Keccak sponge, domain 0x06. Verified against the empty-string and "abc" FIPS 202 vectors) |
