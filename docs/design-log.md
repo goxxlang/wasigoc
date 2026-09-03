@@ -1688,6 +1688,34 @@ Full `ctest` both repos (279 = the existing 278 + the new
 `sync_stress_test`): 279/279. `runtime_smoketest` reconfirmed with real
 asserts (no `-DNDEBUG`) at both `-O0` and `-O2`, repeated runs, clean.
 
+**Same day, one more small round -- map a VThread to the real OS thread
+that served it.** `VThread` gains `os_thread` (a `std::thread::id`),
+and there's a new global, mutex-protected `gocvm::OSThreadFor(vthread_id)`
+lookup by plain numeric id (useful when a caller -- logging, metrics --
+only has the id, not the VThread pointer, and the mapping needs to
+outlive the VThread's own collection). `AsyncHostBridge::Completion`
+gained `worker_thread`; `apply_completion()` records it on both the
+VThread and the global map whenever a bridge sets it (default
+`std::thread::id()`, "none", for a bridge that never does). shim_sandbox's
+`AsyncSapiBridge` sets it via `std::this_thread::get_id()` in its worker
+thread before handing a completion back -- trivial with exactly one
+worker thread, but the plumbing doesn't assume that stays true.
+
+Verified two ways: a new `tests/runtime_smoketest.cc` case
+(`gocvm_vthread_maps_to_real_os_thread`) uses a fake bridge backed by a
+REAL `std::thread` (unlike the existing `FakeAsyncBridge`, which
+answers synchronously from the scheduler thread) and confirms
+`OSThreadFor` returns a real, non-null id that is neither the calling
+thread's nor a placeholder -- specifically the fake's own worker
+thread. Then end to end for real: a hand-built program linking the
+actual `shim_sandbox` `AsyncSapiBridge`, doing a real `syscall.getpid`
+gocvm call, confirming the serving VThread maps to a real, distinct OS
+thread, not a test double. `CallAsyncAwaiter` gained a `vthread_id`
+field (populated in `await_suspend`) so a caller keeping a named
+awaiter (`auto a = CallAsync(...); r = co_await a;`) can look this up
+afterward -- generated code never needs it, only introspection like
+this.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
