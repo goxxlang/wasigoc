@@ -60,6 +60,7 @@
 #include <iostream>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstddef>
@@ -69,6 +70,7 @@
 #include <sys/stat.h>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -962,18 +964,75 @@ class PersistentBase {
   virtual GCObject* GetObject() const = 0;
 };
 
+// Forward-declared so Heap::MakeRooted below can name Persistent<T> as
+// a return type; fully defined further down, after Heap.
+template<class T>
+class Persistent;
+
+// mu_ protects objects_/roots_ (Make/AddRoot_locked/RemoveRoot_locked/
+// Collect) AND, via Persistent<T> below taking the same lock around its
+// own p_ mutations, the actual pointer value each root holds -- a
+// concurrent Collect() calling PersistentBase::GetObject() while
+// another thread's Persistent<T>::operator= is mid-reassignment would
+// otherwise be a data race on p_ itself, not just on the roots_ vector
+// that points at it. Coarse-grained on purpose: Collect() holds mu_ for
+// its entire mark-sweep pass, so allocation/root registration from
+// another thread blocks until a collection finishes rather than
+// racing with it -- correct, not concurrent/incremental GC, which is a
+// substantially bigger undertaking this runtime doesn't need yet
+// (nothing today actually allocates from more than one thread; this is
+// prerequisite correctness for if/when something does).
 class Heap {
  public:
+  // HAZARD under real concurrent Collect(): the returned pointer is
+  // published into objects_ (so Collect() on ANY thread can see and
+  // sweep it) before this call even returns, let alone before the
+  // caller has had a chance to root it. In the original single-thread-
+  // only cooperative model this was never reachable -- nothing else
+  // could run between Make() returning and the caller rooting its
+  // result, since only one thread ever executed at all -- but a real
+  // concurrent Collect() on another thread can now legitimately see
+  // this object as unreached-from-any-root and delete it in that
+  // window, handing the caller a dangling pointer. Confirmed by
+  // stress-testing: reproduces as a real, if intermittent, crash
+  // (mark-loop type confusion from calling a virtual method through a
+  // freed object) with a bare Make()-then-root-separately pattern
+  // under real multi-threaded load, at a rate too low to be caught by
+  // casual testing but real. Use MakeRooted() below for anything that
+  // might run where a concurrent Collect() is possible; Make() stays
+  // for the (still current, still the only shipped usage) single-
+  // scheduler-thread case where the hazard is unreachable by
+  // construction.
   template<class T, class... Args>
   T* Make(Args&&... args) {
     static_assert(std::is_base_of<GCObject, T>::value,
                   "gc::Make requires a GarbageCollected<T> type");
     T* p = new T(std::forward<Args>(args)...);
+    std::lock_guard<std::mutex> lk(mu_);
     objects_.push_back(p);
     return p;
   }
-  void AddRoot(PersistentBase* r) { roots_.push_back(r); }
-  void RemoveRoot(PersistentBase* r) {
+  // Race-free sibling of Make(): allocates AND roots the result in the
+  // SAME critical section, so it is never visible to objects_ without
+  // also already being reachable via the returned Persistent<T> --
+  // there is no window for a concurrent Collect() on another thread to
+  // observe it as unreached. Prefer this whenever the result needs to
+  // survive a possibly-concurrent Collect() before the caller gets
+  // around to rooting it explicitly.
+  template<class T, class... Args>
+  Persistent<T> MakeRooted(Args&&... args) {
+    static_assert(std::is_base_of<GCObject, T>::value,
+                  "gc::MakeRooted requires a GarbageCollected<T> type");
+    T* p = new T(std::forward<Args>(args)...);
+    std::lock_guard<std::mutex> lk(mu_);
+    objects_.push_back(p);
+    return Persistent<T>(p, typename Persistent<T>::AlreadyLockedTag{});
+  }
+  // Caller must hold mu_ -- used only by Persistent<T>, which manages
+  // its own locking around a whole detach+reassign+attach sequence
+  // (see below) rather than taking mu_ separately for each half.
+  void AddRoot_locked(PersistentBase* r) { roots_.push_back(r); }
+  void RemoveRoot_locked(PersistentBase* r) {
     for (size_t i = 0; i < roots_.size(); ++i) {
       if (roots_[i] == r) {
         roots_[i] = roots_.back();
@@ -983,9 +1042,14 @@ class Heap {
     }
   }
   void Collect();
-  std::size_t live() const { return objects_.size(); }
+  std::size_t live() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return objects_.size();
+  }
+  std::mutex& mu() { return mu_; }
 
  private:
+  std::mutex mu_;
   std::vector<GCObject*> objects_;
   std::vector<PersistentBase*> roots_;
 };
@@ -1012,6 +1076,7 @@ class Visitor {
 };
 
 inline void Heap::Collect() {
+  std::lock_guard<std::mutex> lk(mu_);
   for (auto* o : objects_) o->color = kWhite;
   std::vector<GCObject*> grey;
   for (auto* r : roots_) {
@@ -1036,47 +1101,86 @@ inline void Heap::Collect() {
   objects_.swap(keep);
 }
 
+// Every mutator below takes heap().mu() for its WHOLE detach+reassign+
+// attach sequence (one lock_guard, not detach()'s and attach()'s own
+// separate acquisitions) -- otherwise a concurrent Collect() could
+// observe this root mid-update, with the old target already un-rooted
+// but the new one not yet rooted (or, worse, read p_ itself mid-write,
+// a plain data race regardless of roots_ bookkeeping). Collect() takes
+// the same mutex for its entire pass, so "this Persistent's target"
+// and "which objects Collect() considers reachable" can never
+// interleave.
 template<class T>
 class Persistent : public PersistentBase {
+  friend class Heap;
+  // Tag-constructed by Heap::MakeRooted only, which already holds
+  // heap().mu() when it does -- see the comment there for why plain
+  // Make() + a separate rooting step isn't safe under real concurrent
+  // Collect().
+  struct AlreadyLockedTag {};
+  Persistent(T* p, AlreadyLockedTag) : p_(p) { attach_locked(); }
+
   T* p_ = nullptr;
-  void attach() {
-    if (p_) heap().AddRoot(this);
+  // Caller must hold heap().mu().
+  void attach_locked() {
+    if (p_) heap().AddRoot_locked(this);
   }
-  void detach() {
-    if (p_) heap().RemoveRoot(this);
+  void detach_locked() {
+    if (p_) heap().RemoveRoot_locked(this);
+  }
+  void reset_locked(T* p) {
+    detach_locked();
+    p_ = p;
+    attach_locked();
   }
 
  public:
   Persistent() = default;
-  Persistent(T* p) : p_(p) { attach(); }
-  ~Persistent() { detach(); }
+  Persistent(T* p) {
+    std::lock_guard<std::mutex> lk(heap().mu());
+    reset_locked(p);
+  }
+  ~Persistent() {
+    std::lock_guard<std::mutex> lk(heap().mu());
+    detach_locked();
+  }
   Persistent(const Persistent&) = delete;
   Persistent& operator=(const Persistent&) = delete;
-  Persistent(Persistent&& o) noexcept : p_(o.p_) {
-    o.detach();
+  Persistent(Persistent&& o) noexcept {
+    std::lock_guard<std::mutex> lk(heap().mu());
+    p_ = o.p_;
+    o.detach_locked();
     o.p_ = nullptr;
-    attach();
+    attach_locked();
   }
   Persistent& operator=(Persistent&& o) noexcept {
     if (this == &o) return *this;
-    detach();
+    std::lock_guard<std::mutex> lk(heap().mu());
+    detach_locked();
     p_ = o.p_;
-    o.detach();
+    o.detach_locked();
     o.p_ = nullptr;
-    attach();
+    attach_locked();
     return *this;
   }
   Persistent& operator=(T* p) {
-    detach();
-    p_ = p;
-    attach();
+    std::lock_guard<std::mutex> lk(heap().mu());
+    reset_locked(p);
     return *this;
   }
   Persistent& operator=(std::nullptr_t) {
-    detach();
+    std::lock_guard<std::mutex> lk(heap().mu());
+    detach_locked();
     p_ = nullptr;
     return *this;
   }
+  // Unlocked: a caller reading get()/operator->/operator* concurrently
+  // with another thread reassigning the SAME Persistent<T> is racing
+  // on p_ regardless -- exactly like reading a plain T* both a writer
+  // and a reader touch without their own synchronization. Callers that
+  // share a Persistent<T> across threads need their own external
+  // synchronization for that (a real Chan, or a real sync.Mutex once
+  // it exists) the same way any other shared mutable variable would.
   T* get() const { return p_; }
   T* operator->() const { return p_; }
   T& operator*() const { return *p_; }
@@ -1730,11 +1834,17 @@ struct VThread : gc::GarbageCollected<VThread> {
   void Trace(gc::Visitor&) const override {}
 };
 
-inline VThread* RegisterThread() {
-  auto* t = gc::heap().Make<VThread>();
-  static uint64_t next_id = 0;
-  t->id = ++next_id;
-  return t;
+// MakeRooted, not Make()+a separate rooting step: the latter would
+// leave the freshly-allocated VThread visible to objects_ (so any
+// thread's concurrent Collect() could sweep it) before the caller
+// assigns it into its own Persistent<VThread> -- see the hazard
+// documented on Heap::Make() above. Confirmed by stress-testing to be
+// a real, if rare, crash otherwise.
+inline gc::Persistent<VThread> RegisterThread() {
+  auto root = gc::heap().MakeRooted<VThread>();
+  static std::atomic<uint64_t> next_id{0};
+  root->id = next_id.fetch_add(1, std::memory_order_relaxed) + 1;
+  return root;
 }
 
 // (string, error) -- the same "rN field per return value" shape every
@@ -1831,48 +1941,102 @@ inline void set_os_args(int argc, char** argv) {
 // unordered_map on purpose: Go's iteration order is unspecified, and C++ does
 // not pretend otherwise. Nil vs empty is preserved; assign-to-nil panics.
 
+// Real Go maps are NOT internally synchronized -- concurrent use is
+// documented undefined behavior, but the runtime makes a best-effort
+// check (a `hashWriting` flag flipped around every mutating op) and
+// crashes with "fatal error: concurrent map writes"/"...map read and
+// map write" instead of silently corrupting the table. Matching that
+// FAILURE MODE (detect-and-crash) rather than adding real locking is
+// the correct parity choice here: real Go gives the programmer zero
+// protection either, by design -- a concurrent map is a bug to fix in
+// the Go++ program (with a Mutex or a channel), not something this
+// runtime should paper over. Contrast Chan below, which real Go DOES
+// guarantee safe for concurrent use and which gets real locking.
 template<class K, class V>
 struct Map {
   using inner = std::unordered_map<K, V>;
-  std::shared_ptr<inner> p;
+  struct Inner {
+    inner data;
+    std::atomic<bool> writing{false};
+  };
+  std::shared_ptr<Inner> p;
+
+  // RAII: sets the flag on entry (panicking if already set -- someone
+  // else is mid-mutation), clears it on exit. Held only for the
+  // duration of one map operation, same as real Go's own hashWriting
+  // window.
+  struct WriteGuard {
+    std::atomic<bool>* flag;
+    explicit WriteGuard(std::atomic<bool>* f) : flag(f) {
+      if (flag->exchange(true, std::memory_order_acq_rel)) {
+        panic("fatal error: concurrent map writes");
+      }
+    }
+    ~WriteGuard() { flag->store(false, std::memory_order_release); }
+    WriteGuard(const WriteGuard&) = delete;
+    WriteGuard& operator=(const WriteGuard&) = delete;
+  };
+  void check_not_writing(const char* what) const {
+    if (p && p->writing.load(std::memory_order_acquire)) {
+      panic(std::string("fatal error: concurrent map ") + what + " and map write");
+    }
+  }
 
   Map() = default;
-  Map(std::initializer_list<std::pair<const K, V>> xs) : p(std::make_shared<inner>(xs)) {}
+  Map(std::initializer_list<std::pair<const K, V>> xs) : p(std::make_shared<Inner>()) {
+    p->data = inner(xs);
+  }
 
   static Map make() {
     Map m;
-    m.p = std::make_shared<inner>();
+    m.p = std::make_shared<Inner>();
     return m;
   }
 
   bool is_nil() const { return !p; }
-  int64_t len() const { return p ? static_cast<int64_t>(p->size()) : 0; }
-  std::size_t size() const { return p ? p->size() : 0; }
+  int64_t len() const {
+    check_not_writing("len");
+    return p ? static_cast<int64_t>(p->data.size()) : 0;
+  }
+  std::size_t size() const {
+    check_not_writing("len");
+    return p ? p->data.size() : 0;
+  }
 
   V& operator[](const K& k) {
     if (!p) panic("assignment to entry in nil map");
-    return (*p)[k];
+    WriteGuard g(&p->writing);
+    return p->data[k];
   }
 
   std::pair<V, bool> lookup(const K& k) const {
     if (!p) return {V{}, false};
-    auto it = p->find(k);
-    if (it == p->end()) return {V{}, false};
+    check_not_writing("read");
+    auto it = p->data.find(k);
+    if (it == p->data.end()) return {V{}, false};
     return {it->second, true};
   }
 
   void del(const K& k) {
-    if (p) p->erase(k);
+    if (!p) return;
+    WriteGuard g(&p->writing);
+    p->data.erase(k);
+  }
+
+  void clear() {
+    if (!p) return;
+    WriteGuard g(&p->writing);
+    p->data.clear();
   }
 
   static inner& empty_inner() {
     static inner e;
     return e;
   }
-  auto begin() { return p ? p->begin() : empty_inner().begin(); }
-  auto end() { return p ? p->end() : empty_inner().end(); }
-  auto begin() const { return p ? p->begin() : empty_inner().begin(); }
-  auto end() const { return p ? p->end() : empty_inner().end(); }
+  auto begin() { check_not_writing("iteration"); return p ? p->data.begin() : empty_inner().begin(); }
+  auto end() { check_not_writing("iteration"); return p ? p->data.end() : empty_inner().end(); }
+  auto begin() const { check_not_writing("iteration"); return p ? p->data.begin() : empty_inner().begin(); }
+  auto end() const { check_not_writing("iteration"); return p ? p->data.end() : empty_inner().end(); }
 };
 
 template<class K, class V>
@@ -1893,7 +2057,7 @@ void del(Map<K, V>& m, const K& k) {
 }
 template<class K, class V>
 void gclear(Map<K, V> m) {
-  if (m.p) m.p->clear();
+  m.clear();
 }
 
 template<class T>
@@ -1909,11 +2073,37 @@ T* New() {
 // wasm32-wasip1 (wasi-threads / pthread would be forcing Go's OS-facing
 // scheduler onto a target that does not have it).
 
+// Thread-safety note: nothing in this runtime spawns more than one
+// thread running Go++ generated code today (the async gocvm worker
+// thread -- see AsyncHostBridge below -- never touches Chan/Scheduler/
+// gc::Heap directly, only its own private job/result queues), so this
+// is prerequisite correctness, not something today's behavior depends
+// on. Made real anyway because Chan below is: real Go guarantees
+// channels are safe for concurrent use by multiple goroutines, and a
+// Chan whose completion path (complete_send/complete_recv) reaches into
+// an unsynchronized ready queue wouldn't actually BE thread-safe end to
+// end, whatever locking Chan itself did.
 struct Scheduler {
   std::deque<std::coroutine_handle<>> ready;
-  int parked = 0;
+  std::atomic<int> parked{0};
+  std::mutex ready_mu;
 
-  void enqueue(std::coroutine_handle<> h) { ready.push_back(h); }
+  void enqueue(std::coroutine_handle<> h) {
+    std::lock_guard<std::mutex> lk(ready_mu);
+    ready.push_back(h);
+  }
+  // Non-blocking: false (leaves *out untouched) if nothing is ready.
+  bool try_dequeue(std::coroutine_handle<>* out) {
+    std::lock_guard<std::mutex> lk(ready_mu);
+    if (ready.empty()) return false;
+    *out = ready.front();
+    ready.pop_front();
+    return true;
+  }
+  bool ready_empty() {
+    std::lock_guard<std::mutex> lk(ready_mu);
+    return ready.empty();
+  }
 
   void run();  // defined after Task
 };
@@ -2212,9 +2402,8 @@ inline CallAsyncAwaiter CallAsync(const std::string& topic, const std::string& p
 
 inline void Scheduler::run() {
   for (;;) {
-    while (!ready.empty()) {
-      auto h = ready.front();
-      ready.pop_front();
+    std::coroutine_handle<> h;
+    while (try_dequeue(&h)) {
       h.resume();
       if (h.done()) h.destroy();
       gocvm::detail::drain_async_completions();
@@ -2318,7 +2507,14 @@ struct Chan {
     int idx = -1;
     bool counted = true;
   };
+  // Real Go guarantees channels are safe for concurrent use by
+  // multiple goroutines -- this is the one core data structure in this
+  // runtime that gets REAL locking, not a best-effort detector like Map
+  // below. `mu` protects every field beneath it; a caller holding it
+  // may safely touch buf/closed/recvs/sends directly (the *_locked
+  // methods and Select's GSelect::Awaiter below do exactly that).
   struct State {
+    std::mutex mu;
     std::deque<T> buf;
     std::size_t cap = 0;
     bool closed = false;
@@ -2331,9 +2527,24 @@ struct Chan {
   explicit Chan(std::size_t cap) : st(std::make_shared<State>()) { st->cap = cap; }
 
   bool is_nil() const { return !st; }
+  // Exposed so GSelect::Awaiter can lock several channels' State
+  // together (address-sorted, see GSelect below) for the duration of a
+  // select's whole check-then-park sequence -- a channel's own mutex
+  // held only per-call (as try_send/try_recv/park_* do on their own)
+  // is not enough to make a MULTI-channel select atomic against a
+  // concurrent plain send/recv on any one of its channels.
+  std::mutex* mutex() const { return st ? &st->mu : nullptr; }
 
   static bool is_cancelled(const std::shared_ptr<bool>& c) { return c && *c; }
 
+  // complete_recv/complete_send hand a value across to a parked
+  // waiter's own Awaiter storage (w.slot/w.ok, or nothing for a send)
+  // and wake its coroutine. Called with st->mu held. The write here and
+  // scheduler().enqueue()'s own internal lock together establish the
+  // happens-before edge the resuming thread's unsynchronized read of
+  // that Awaiter-local storage in await_resume() relies on -- do not
+  // remove the enqueue-through-a-lock indirection thinking it's just
+  // queue bookkeeping.
   static void complete_recv(RecvWaiter& w, T&& v, bool ok) {
     if (is_cancelled(w.cancelled)) return;
     if (w.cancelled) *w.cancelled = true;
@@ -2352,7 +2563,8 @@ struct Chan {
     scheduler().enqueue(w.h);
   }
 
-  bool try_send(T& value) {
+  // Caller must hold st->mu.
+  bool try_send_locked(T& value) {
     if (!st) panic("send on nil channel");
     if (st->closed) panic("send on closed channel");
     while (!st->recvs.empty()) {
@@ -2369,7 +2581,8 @@ struct Chan {
     return false;
   }
 
-  bool try_recv(T* slot, bool* ok) {
+  // Caller must hold st->mu.
+  bool try_recv_locked(T* slot, bool* ok) {
     if (!st) panic("receive from nil channel");
     if (!st->buf.empty()) {
       if (slot) *slot = std::move(st->buf.front());
@@ -2402,15 +2615,52 @@ struct Chan {
     return false;
   }
 
+  // Unlocked entry points for the plain (non-select) awaiters below --
+  // acquire st->mu for one call.
+  bool try_send(T& value) {
+    std::lock_guard<std::mutex> lk(st->mu);
+    return try_send_locked(value);
+  }
+  bool try_recv(T* slot, bool* ok) {
+    std::lock_guard<std::mutex> lk(st->mu);
+    return try_recv_locked(slot, ok);
+  }
+
+  // Caller must hold st->mu -- used only by GSelect (see below), which
+  // parks on every non-default case's channel while still holding all
+  // of them, so no "did someone complete this while nothing held the
+  // lock" gap exists between the readiness check and the park.
+  void park_recv_locked(std::coroutine_handle<> h, T* slot, bool* ok,
+                        std::shared_ptr<bool> cancelled, std::shared_ptr<int> winner, int idx) {
+    st->recvs.push_back(
+        RecvWaiter{h, slot, ok, std::move(cancelled), std::move(winner), idx, /*counted=*/false});
+  }
+  void park_send_locked(std::coroutine_handle<> h, T value, std::shared_ptr<bool> cancelled,
+                        std::shared_ptr<int> winner, int idx) {
+    st->sends.push_back(SendWaiter{h, std::move(value), std::move(cancelled), std::move(winner), idx,
+                                   /*counted=*/false});
+  }
+
+  // Each plain awaiter below re-checks under st->mu inside
+  // await_suspend (not just once in await_ready): another thread could
+  // complete the operation in the window between await_ready releasing
+  // the lock and await_suspend re-acquiring it. Returning false from
+  // await_suspend (C++20's "changed your mind, resume immediately"
+  // signal) makes that re-check race-free without needing to hold the
+  // lock across both calls the way GSelect must.
   struct SendAwaiter {
     Chan* ch;
     T value;
     bool await_ready() { return ch->try_send(value); }
-    void await_suspend(std::coroutine_handle<> h) {
+    bool await_suspend(std::coroutine_handle<> h) {
+      std::lock_guard<std::mutex> lk(ch->st->mu);
+      if (ch->try_send_locked(value)) return false;
       ch->st->sends.push_back(SendWaiter{h, std::move(value), nullptr, nullptr, -1, true});
       scheduler().parked++;
+      return true;
     }
     void await_resume() {
+      std::lock_guard<std::mutex> lk(ch->st->mu);
       if (ch->st && ch->st->closed) panic("send on closed channel");
     }
   };
@@ -2420,9 +2670,12 @@ struct Chan {
     T value{};
     bool ok = false;
     bool await_ready() { return ch->try_recv(&value, &ok); }
-    void await_suspend(std::coroutine_handle<> h) {
+    bool await_suspend(std::coroutine_handle<> h) {
+      std::lock_guard<std::mutex> lk(ch->st->mu);
+      if (ch->try_recv_locked(&value, &ok)) return false;
       ch->st->recvs.push_back(RecvWaiter{h, &value, &ok, nullptr, nullptr, -1, true});
       scheduler().parked++;
+      return true;
     }
     T await_resume() { return std::move(value); }
   };
@@ -2432,9 +2685,12 @@ struct Chan {
     T value{};
     bool ok = false;
     bool await_ready() { return ch->try_recv(&value, &ok); }
-    void await_suspend(std::coroutine_handle<> h) {
+    bool await_suspend(std::coroutine_handle<> h) {
+      std::lock_guard<std::mutex> lk(ch->st->mu);
+      if (ch->try_recv_locked(&value, &ok)) return false;
       ch->st->recvs.push_back(RecvWaiter{h, &value, &ok, nullptr, nullptr, -1, true});
       scheduler().parked++;
+      return true;
     }
     std::pair<T, bool> await_resume() { return {std::move(value), ok}; }
   };
@@ -2445,6 +2701,7 @@ struct Chan {
 
   void close() {
     if (!st) panic("close of nil channel");
+    std::lock_guard<std::mutex> lk(st->mu);
     if (st->closed) panic("close of closed channel");
     st->closed = true;
     while (!st->recvs.empty()) {
@@ -2504,9 +2761,13 @@ class GSelect {
  public:
   struct Case {
     virtual ~Case() = default;
+    // Caller must hold every participating case's chan_mutex() (see
+    // Awaiter below) before calling either of these.
     virtual bool try_now() = 0;
     virtual void park(std::coroutine_handle<> h, std::shared_ptr<bool> cancel,
                       std::shared_ptr<int> winner) = 0;
+    // nullptr for a default case (nothing to lock).
+    virtual std::mutex* chan_mutex() = 0;
     bool is_default = false;
   };
 
@@ -2517,11 +2778,12 @@ class GSelect {
     bool* ok;
     int idx;
     RecvCase(Chan<T>* c, T* d, bool* o, int i) : ch(c), dst(d), ok(o), idx(i) {}
-    bool try_now() override { return ch->try_recv(dst, ok); }
+    bool try_now() override { return ch->try_recv_locked(dst, ok); }
     void park(std::coroutine_handle<> h, std::shared_ptr<bool> cancel,
               std::shared_ptr<int> winner) override {
-      ch->park_recv(h, dst, ok, std::move(cancel), std::move(winner), idx);
+      ch->park_recv_locked(h, dst, ok, std::move(cancel), std::move(winner), idx);
     }
+    std::mutex* chan_mutex() override { return ch->mutex(); }
   };
 
   template<class T>
@@ -2530,17 +2792,19 @@ class GSelect {
     T value;
     int idx;
     SendCase(Chan<T>* c, T v, int i) : ch(c), value(std::move(v)), idx(i) {}
-    bool try_now() override { return ch->try_send(value); }
+    bool try_now() override { return ch->try_send_locked(value); }
     void park(std::coroutine_handle<> h, std::shared_ptr<bool> cancel,
               std::shared_ptr<int> winner) override {
-      ch->park_send(h, std::move(value), std::move(cancel), std::move(winner), idx);
+      ch->park_send_locked(h, std::move(value), std::move(cancel), std::move(winner), idx);
     }
+    std::mutex* chan_mutex() override { return ch->mutex(); }
   };
 
   struct DefaultCase : Case {
     DefaultCase() { is_default = true; }
     bool try_now() override { return true; }
     void park(std::coroutine_handle<>, std::shared_ptr<bool>, std::shared_ptr<int>) override {}
+    std::mutex* chan_mutex() override { return nullptr; }
   };
 
   std::vector<std::unique_ptr<Case>> cases;
@@ -2569,8 +2833,32 @@ class GSelect {
     std::shared_ptr<int> winner = std::make_shared<int>(-1);
     int result = -1;
     bool did_park = false;
+    // Held across BOTH await_ready() and await_suspend() when the
+    // first call leaves them locked (i.e. returns false) -- this is
+    // what makes "check every case, and if none ready, park on every
+    // case" one atomic sequence instead of two, closing the race a
+    // concurrent plain send/recv on any participating channel could
+    // otherwise slip through. Address-sorted (same idea real Go's own
+    // selectgo uses: sorting channel lock order by address) so two
+    // concurrent selects sharing channels can never deadlock each
+    // other regardless of the order their case lists name them in.
+    std::vector<std::unique_lock<std::mutex>> locks;
 
-    bool await_ready() {
+    void lock_all() {
+      std::vector<std::mutex*> mus;
+      for (auto& cs : cases) {
+        if (auto* m = cs->chan_mutex()) {
+          if (std::find(mus.begin(), mus.end(), m) == mus.end()) mus.push_back(m);
+        }
+      }
+      std::sort(mus.begin(), mus.end());
+      locks.clear();
+      locks.reserve(mus.size());
+      for (auto* m : mus) locks.emplace_back(*m);
+    }
+    void unlock_all() { locks.clear(); }
+
+    bool try_ready_locked() {
       for (int i = 0; i < static_cast<int>(cases.size()); ++i) {
         if (cases[static_cast<std::size_t>(i)]->is_default) continue;
         if (cases[static_cast<std::size_t>(i)]->try_now()) {
@@ -2587,7 +2875,24 @@ class GSelect {
       return false;
     }
 
-    void await_suspend(std::coroutine_handle<> h) {
+    bool await_ready() {
+      lock_all();
+      if (try_ready_locked()) {
+        unlock_all();
+        return true;
+      }
+      return false;  // locks stay held for await_suspend below
+    }
+
+    bool await_suspend(std::coroutine_handle<> h) {
+      // Still holding the locks acquired in await_ready(). Re-check:
+      // another thread may have completed a case in the (nonexistent,
+      // by construction) gap between the two calls -- re-checking is
+      // cheap insurance against ever assuming that gap can't matter.
+      if (try_ready_locked()) {
+        unlock_all();
+        return false;  // resume immediately, don't suspend
+      }
       did_park = true;
       auto cancel = std::make_shared<bool>(false);
       scheduler().parked++;
@@ -2595,6 +2900,8 @@ class GSelect {
         if (cs->is_default) continue;
         cs->park(h, cancel, winner);
       }
+      unlock_all();
+      return true;
     }
 
     int await_resume() {

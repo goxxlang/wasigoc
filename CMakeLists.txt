@@ -39,6 +39,17 @@ add_executable(wasigo_runtime_smoketest tests/runtime_smoketest.cc)
 target_include_directories(wasigo_runtime_smoketest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME runtime_smoketest COMMAND wasigo_runtime_smoketest)
 
+# Real multi-threaded stress test for Chan/Map/gc::Heap's synchronization
+# (prerequisite thread-safety for eventually running goroutines on real
+# OS threads, not exercised by anything else -- runtime_smoketest above
+# is single-threaded). Needs real threads, unlike the rest of this
+# build.
+find_package(Threads REQUIRED)
+add_executable(wasigo_sync_stress_test tests/sync/sync_stress_test.cc)
+target_include_directories(wasigo_sync_stress_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(wasigo_sync_stress_test PRIVATE Threads::Threads)
+add_test(NAME sync_stress_test COMMAND wasigo_sync_stress_test)
+
 add_executable(wasigo_frontend_test tests/frontend_test.cc)
 target_link_libraries(wasigo_frontend_test PRIVATE wasigoc_lib)
 add_test(NAME frontend_test COMMAND wasigo_frontend_test)
