@@ -1501,6 +1501,108 @@ the file (including the exact bug class a previous round of this diary
 already found and fixed in this same script), but ask the user to
 smoke-test `goclang++.bat` themselves before relying on it.
 
+**2026-09-03, same day, much later still -- a real full cutover, two
+real UB bugs in `go func(){...}()`, and GocVM goes non-blocking.**
+Asked "are we ready for a release," the honest answer was no for a
+reason with nothing to do with code quality: `~/go++` had never been a
+git repository at all -- this entire day's work (everything above,
+across many sessions) lived only as loose files on one machine, and
+`~/WASIGo++` (the real `goxxlang/wasigoc` checkout, already tagged
+`v0.2.1` that same morning, before any of this existed) had no idea any
+of it existed either. Per explicit direction, did a full cutover
+instead of a selective merge: mirrored `~/go++` over `~/WASIGo++`
+wholesale (keeping `.git`), dropping the two packages (`go/build`,
+`go/build/constraint`) that only ever existed in `WASIGo++` -- "don't
+care about the old code." Committed. `shim_sandbox` had the identical
+problem (~2000 lines of real Winsock/Win32 backend work, `git log`
+showed exactly one commit) and got the same treatment once it became
+clear the async bridge below depends on it.
+
+Investigating a since-fixed `runtime_smoketest` crash (real root cause:
+`CMAKE_BUILD_TYPE=Release`'s `-DNDEBUG` had been silently compiling out
+every `assert()` in that file all along -- "278/278 passing" was never
+a real check of it) surfaced a genuine, general, previously-latent
+compiler bug: `EmitGo` compiled `go func(){ <uses channels> }()` to
+`wasigo::go((<closure>)());` -- immediately invoking the closure and
+handing the resulting (initially suspended) Task to `go()`. A lambda
+coroutine's frame stores only a pointer back to its own closure
+("this"); capture mode doesn't change that. The temporary closure is
+destroyed at the end of that expression, but the Task is only initially
+suspended -- the scheduler resumes it later, reading through a by-then-
+dangling pointer. `grep` confirmed zero existing stdlib/example source
+used this pattern, so -- same shape as the `go recv.AsyncMethod(...)`
+bug earlier in this diary -- it was simply never exercised before.
+Fixed with two new `runtime.hpp` helpers, `GoAsyncLit`/`GoAsyncLitT`,
+that take the closure itself (uninvoked) as a genuine by-value coroutine
+parameter -- frame-owned, survives suspension -- then invoke and
+`co_await` it internally; `EmitGo` routes an async go-target literal
+through these, and defers a non-async one via the existing `[=]{...;}`
+wrap-and-call-later shape every other synchronous go target already
+uses (which also happened to fix a real "invalid use of void
+expression" compile error the old form hit for `go func(){ <no
+channels> }()`, likewise never previously exercised). Second bug found
+fixing the first: `EmitFuncLit`'s async branch captures by value (`[=]`)
+but was never marked `mutable`, so any non-const method on a captured-
+by-value object (`Chan::send` -- called by every channel-using async
+literal) failed to compile with "discards qualifiers." `tests/
+runtime_smoketest.cc` had the hand-written version of the same dangling-
+closure pattern in `pingpong()`/`returning_task()` -- fixed the same
+way -- plus its own `boom_local()` bug: `assert(order == "R01")` was
+checked before `DeferList`'s destructor (what actually runs the
+deferred closures) had fired. All verified for real this time: built
+directly with asserts live (no `NDEBUG`) at both `-O0` and `-O2`,
+repeated runs, clean.
+
+With those real bugs out of the way, tackled a real architectural one:
+`gocvm::Call` is a synchronous, blocking call into `HostBridge::Call` --
+since wasigo's scheduler is single-threaded cooperative with no OS
+threads backing it, one goroutine's slow or indefinitely-blocking host
+call (a socket `recv()` with no data yet, a subprocess that hasn't
+exited) stalled *every other* ready goroutine too, not just its own.
+Built the non-blocking path the original `VThread` comment ("not a
+currently-live state machine") had left for later: a new
+`AsyncHostBridge` (`Submit`/`PollOne`/`WaitOne`) and `gocvm::CallAsync`,
+a real awaitable -- suspending it registers a genuine `VThread`
+(`State::kAwaitingHost`) via the same registry every `go()`-spawned
+goroutine already uses, and `Scheduler::run()` drains completions after
+every resume, blocking on the bridge for one completion (rather than
+declaring deadlock or busy-spinning) only once the ready queue is truly
+empty but async work is outstanding. `cpp_generator.cc`: `gocvm.Call` is
+now a recognized await point (`ExprNeedsAwait` didn't know about it at
+all before -- `IsImportedPackage` explicitly excludes the `gocvm`
+builtin, so the existing `pkg.Func` async-inference branch could never
+have caught it), and compiles unconditionally to `co_await
+wasigo::gocvm::CallAsync(...)`, propagating transitively through the
+existing async-inference machinery exactly like any other await-needing
+call with no other compiler changes needed -- verified: `syscall.
+Getpid()` becomes `TaskT<int64_t>`, its caller becomes a coroutine
+automatically, all the way up to `main()`. `shim_sandbox`'s
+`gocvm_bridge.cc` got a matching `AsyncSapiBridge`, backed by exactly
+ONE worker thread (deliberately not a pool): preserves the same
+serialized access to shim_sandbox's own internals (the handle table
+especially) the old synchronous single-cooperative-thread model already
+relied on, just moved onto its own OS thread so the scheduler's own
+thread is never blocked by it.
+
+Verified the ordering claim directly, not just "it compiles": a new
+`gocvm_async_ordering()` test uses a fake bridge that only ever answers
+from the scheduler's *blocking* `WaitOne` path, and asserts a second,
+unrelated goroutine actually runs to completion *before* the awaiting
+goroutine's request is answered (`order == "BA"`, never `"AB"`) --
+impossible to produce under the old blocking `Call`. Verified with real
+compiled programs too: `syscall.Getpid()` round-trips a real PID through
+the real worker-thread dispatch end to end; a goroutine running `exec.
+Command("ping", "-n", "3", "127.0.0.1").CombinedOutput()` (a real ~2.1s
+subprocess, real exit code, real output) does not block `main()`, which
+prints its own next line immediately and only blocks on the result
+channel -- the whole program still takes the real ~2.1s (nothing
+faked), but that time overlaps with `main` instead of preceding it.
+Full `ctest` both repos: `go++`/`WASIGo++` 278/278 (including every
+existing gocvm-wired package's golden test on the bridge-less
+wasm32-wasip1 path, confirming `CallAsync`'s immediate no-bridge/ABAC-
+deny branch still produces byte-identical fallback output), `shim_sandbox`
+2/2.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
