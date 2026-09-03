@@ -3051,6 +3051,16 @@ class Generator {
       oss << CppType(fl.params[i].type.get()) << " " << CppIdent(fl.params[i].name);
     }
     oss << ")";
+    // An async literal captures by value ([=], above), so the closure
+    // stays valid past the point the enclosing scope returns -- but a
+    // non-mutable lambda's operator() is const, and Go++'s builtin types
+    // (Chan, Slice, Map, ...) almost all have non-const mutating methods
+    // (Chan::send in particular -- every channel-using async literal
+    // calls it), so without `mutable` here any such call on a
+    // by-value-captured object fails to compile with "discards
+    // qualifiers". `[&]` (the non-async branch) never needs this: a
+    // reference isn't const just because operator() is.
+    if (async) oss << " mutable";
     if (async) {
       if (fl.results.empty()) oss << " -> wasigo::Task";
       else if (fl.results.size() == 1)
@@ -3469,7 +3479,7 @@ class Generator {
         }
       }
       if (e.callee->kind == ExprKind::FuncLit) {
-        out_ << Indent() << "wasigo::go((" << EmitExpr(*e.callee) << ")());\n";
+        EmitGoFuncLit(*e.callee);
         return;
       }
       // go f() for a sync f, including fmt / builtins
@@ -3477,10 +3487,35 @@ class Generator {
       return;
     }
     if (e.kind == ExprKind::FuncLit) {
-      out_ << Indent() << "wasigo::go((" << EmitExpr(e) << ")());\n";
+      EmitGoFuncLit(e);
       return;
     }
     out_ << Indent() << "wasigo::go([=]{ " << EmitExpr(e) << "; });\n";
+  }
+
+  // `go func(){...}()`: see the GoAsyncLit/GoAsyncLitT doc comment in
+  // runtime.hpp for why a channel-using literal can't be immediately
+  // invoked and handed to wasigo::go(...) directly (dangling closure).
+  // A non-async literal has no such hazard once it's deferred behind an
+  // ordinary (non-coroutine) wrapper -- same "go f()" fallback shape as
+  // every other synchronous go target already uses -- so only the async
+  // case needs the GoAsyncLit(T) indirection.
+  void EmitGoFuncLit(const Expr& lit) {
+    if (!lit.func_lit) Error("internal: go target is not a func literal");
+    bool async = StmtsNeedAwait(lit.func_lit->body);
+    if (!async) {
+      out_ << Indent() << "wasigo::go([=]{ (" << EmitExpr(lit) << ")(); });\n";
+      return;
+    }
+    const auto& results = lit.func_lit->results;
+    if (results.empty()) {
+      out_ << Indent() << "wasigo::go(wasigo::GoAsyncLit(" << EmitExpr(lit) << "));\n";
+    } else if (results.size() == 1) {
+      out_ << Indent() << "wasigo::go(wasigo::GoAsyncLitT<" << CppType(results[0].get()) << ">("
+           << EmitExpr(lit) << "));\n";
+    } else {
+      Error("a func literal that uses channels cannot return multiple values");
+    }
   }
 
   void EmitDefer(const Stmt& s) {

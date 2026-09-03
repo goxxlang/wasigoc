@@ -10,10 +10,18 @@ using namespace wasigo;
 
 static Task pingpong() {
   auto ch = make_chan<int64_t>(0);
-  go([&]() -> Task {
+  // GoAsyncLit, not an immediately-invoked lambda: a coroutine lambda's
+  // frame stores only a pointer back to its own closure ("this"); a
+  // temporary closure invoked-and-discarded inline is destroyed at the
+  // end of this full expression, but the produced Task is only
+  // initially suspended -- the scheduler resumes it later, after the
+  // closure (and this capture-by-reference's referent) is already gone.
+  // See the GoAsyncLit doc comment in runtime.hpp -- same bug class the
+  // compiler's own EmitGo had for `go func(){...}()`.
+  go(GoAsyncLit([&]() -> Task {
     co_await ch.send(7);
     co_return;
-  }());
+  }));
   int64_t v = co_await ch.recv();
   assert(v == 7);
   co_return;
@@ -45,31 +53,41 @@ static TaskT<int64_t> take(Chan<int64_t> ch) {
 
 static Task returning_task() {
   auto ch = make_chan<int64_t>(0);
-  go([&]() -> Task {
+  go(GoAsyncLit([&]() -> Task {
     co_await ch.send(21);
     co_return;
-  }());
+  }));
   int64_t x = co_await take(ch);
   assert(x == 42);
   co_return;
 }
 
-static void boom_local() {
+// Returns the defer-run order rather than asserting on it directly: pf
+// and defers are local to the nested block below, so their destructors
+// (which is what actually runs the deferred closures, exactly like
+// compiler-emitted `goto __wasigo_end` + fall-through does) fire at the
+// closing brace -- *after* any statement placed at this function's own
+// top level would already have executed. Checking `order` in the same
+// place the original single-scope version did was checking it before
+// the defers had run at all.
+static std::string boom_local() {
   std::string order;
-  PanicFrame pf;
-  DeferList defers;
-  defers.push([&] { order += "1"; });
-  defers.push([&] { order += "0"; });
-  defers.push([&] {
-    auto r = recover();
-    assert(r.ok);
-    order += "R";
-  });
-  pf.has_pending = true;
-  pf.pending = "x";
-  goto __wasigo_end;
-__wasigo_end:;
-  assert(order == "R01");
+  {
+    PanicFrame pf;
+    DeferList defers;
+    defers.push([&] { order += "1"; });
+    defers.push([&] { order += "0"; });
+    defers.push([&] {
+      auto r = recover();
+      assert(r.ok);
+      order += "R";
+    });
+    pf.has_pending = true;
+    pf.pending = "x";
+    goto __wasigo_end;
+  __wasigo_end:;
+  }
+  return order;
 }
 
 // -- gocvm::Call's ErrorState state machine (kClear/kBridgeActive/kPanic) --
@@ -241,7 +259,7 @@ int main() {
   auto e2 = errors_new("boom");
   assert(e2.str() == "boom");
 
-  boom_local();
+  assert(boom_local() == "R01");
 
   assert(type_key_of<int64_t>() == type_key_of<int64_t>());
   assert(type_key_of<int64_t>() != type_key_of<std::string>());

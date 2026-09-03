@@ -2088,6 +2088,36 @@ void go(F f) {
   }(std::move(f)));
 }
 
+// `go func(){ <uses channels> }()`: EmitGo cannot invoke the func literal
+// immediately and pass the resulting Task straight to go() the way it
+// does for a plain function or method call, because a *lambda* coroutine
+// (unlike a free function) stores only a pointer back to its own closure
+// object ("this") in its frame -- captured state itself (by value or by
+// reference; capture mode makes no difference here) lives in the closure
+// object, not the frame. `(closure)()` as an immediately-invoked
+// temporary is destroyed at the end of that full expression, but the
+// produced Task is only *initially suspended*: the scheduler resumes it
+// later, by which point the closure is already gone -- a genuine
+// use-after-free, not merely a style concern. (Contrast with go(F f)
+// just above: its own inner `[](F fn) -> Task {...}(std::move(f))` is
+// safe *because* that wrapper lambda is captureless -- fn is a real
+// coroutine parameter living in the frame, not something read through a
+// dangling "this".) Fix: pass the closure ITSELF (uninvoked) as this
+// wrapper's own by-value parameter, so a live copy persists inside the
+// wrapper's own frame for the whole call; only then invoke and co_await
+// it. EmitGo selects GoAsyncLit for a literal with no results, GoAsyncLitT
+// for exactly one (matching EmitFuncLit's own "cannot return multiple
+// values" bound on a channel-using literal).
+template<class F>
+Task GoAsyncLit(F f) {
+  co_await f();
+  co_return;
+}
+template<class T, class F>
+TaskT<T> GoAsyncLitT(F f) {
+  co_return co_await f();
+}
+
 inline int run() {
   scheduler().run();
   return 0;
