@@ -65,6 +65,9 @@ Compile `hello_gen.cpp` with wasi-sdk's **triple wrapper** and the noeh include 
 * **Codecs & Hashes:** Real codecs and hashes (`flate`/`gzip`/`zlib`/`bzip2`/`lzw`, `PNG`/`JPEG`/`GIF`, `SHA-2`/`3`, `AES-128`, `P-256`, `Ed25519`, …) with documented bounds.
 * **Syscall Handling:** GocVM handles (`os/exec`, `net.Dial`; `net.Pipe()` and uses [shim_sandbox](https://github.com/goxxlang/shim_sandbox)).
 * **GC:** Oilpan-lite (cppgc): `GarbageCollected<T>`, `Member<T>`, `Persistent<T>`, stop-the-world mark-sweep via `Trace`/`Visitor`. No Go collector clone — C++ Oilpan on a single-thread WASM target.
+* **GocVM:** Builtin virtual machine bridging WASI syscalls — handles `os/exec`, `net.Dial`, and process-level APIs that raw `wasm32-wasip1` cannot provide, routing I/O through [shim_sandbox](https://github.com/goxxlang/shim_sandbox).
+* **VThreads & Callstack:** Cooperative virtual threads with a managed callstack — goroutines are C++20 stackless coroutines on a single runqueue, with full defer/panic/recover and no OS threads or wasi-threads dependency.
+
 
 Language surface and Rosetta table: [docs/language.md](docs/language.md).
 
