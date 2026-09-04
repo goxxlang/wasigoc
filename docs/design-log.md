@@ -2002,6 +2002,70 @@ Full `ctest`, both repos: 283/283 -- including, after the regression fix,
 `database/sql` and every other plain-`defer`-no-channels package that
 briefly stopped linking.
 
+**Same day, later still -- `Cmd.Stdin` finally pipes real bytes, and it
+took a real deadlock in GocVM's bridge with it.** `Cmd.Stdin` had been
+declared on `os/exec`'s `Cmd` struct since the very first GocVM round but
+was always wired to `NUL` -- nothing sent it anywhere. Added a
+`writeStdin()` goroutine (mirrors the existing `pump()` for Stdout/
+Stderr) that drains `c.Stdin` in 4096-byte chunks into two new topics,
+`os.exec.stdin.write`/`os.exec.stdin.close` (`shim_sandbox`'s
+`ProcEntry::stdin_write` field existed, unused, since the handle-table
+round -- `LaunchProcess` now takes a `with_stdin` bool that swaps the
+child's stdin from `NUL` to a real pipe only for `os.exec.start`, not the
+older one-shot `os.exec` topic, which has no handle to stream into
+mid-call). `CombinedOutput`/`Run`/`Output` now detect `c.Stdin != nil` and
+route through `Start`+`Wait` instead, capturing output into a local
+buffer, specifically because the one-shot topic can't stream input
+during its single blocking call.
+
+Testing this for real -- not just compiling it, actually running a
+program that pipes bytes into a real child process -- hung both the test
+program and its child indefinitely, confirmed via `tasklist`, not
+assumed. Root cause: `gocvm_bridge.cc`'s `AsyncSapiBridge` (added
+non-blocking earlier this session) ran exactly ONE worker thread for
+every topic, a deliberate choice at the time to preserve the same
+serialization the old single-cooperative-thread model relied on.
+`Cmd.Stdin` was the first caller ever needing TWO blocking gocvm calls in
+flight at once on the same process: the stdout-read pump blocks in a
+real `ReadFile` waiting for output the child will only produce after
+consuming stdin, while the stdin-write call sits queued behind it on the
+same one thread -- a permanent deadlock, not a race, reproduced every
+time. Fixed generally, not by special-casing exec: `AsyncSapiBridge` now
+runs a small fixed pool (`kWorkerCount = 4`). That required
+`shim_sandbox/src/sapi/handles.h`/`.cc` (the socket/process/TLS handle
+tables) to become genuinely thread-safe for the first time -- one mutex
+around every `Alloc*`/`Lookup*`/`Release` map operation, relying on (and
+documenting) a real C++ standard guarantee: `std::unordered_map` never
+invalidates a live element's pointer/reference except by erasing that
+exact element, so a pointer returned by `LookupProcess`/etc. stays safe
+to use after the lock is released, across the actual blocking Win32 call
+-- only the map's own bookkeeping needs the lock, not the I/O itself.
+Added `CloseProcessStdin` as a dedicated locked helper rather than
+letting `ExecStdinClose` mutate `ProcEntry::stdin_write` through a raw
+looked-up pointer with no lock at all, which would have raced `Release`'s
+own read of that same field. One residual, documented (not silently
+papered over) limitation: don't `Release`/`CloseProcessStdin` a handle
+while another call on that same handle is still in flight -- every
+existing caller already respects this by construction (`Wait()` joins
+its pump/writeStdin goroutines before triggering the handle's `Release`),
+but it's a caller obligation the lock itself doesn't enforce.
+
+This may also retroactively explain (not reverified) part of the
+earlier-documented "two goroutines in the same process can't rendezvous
+through blocking `Accept()`+`Dial()`" limitation, previously attributed
+entirely to wasigo's single-OS-thread cooperative scheduler -- worth
+retesting same-process `Accept()`+`Dial()` next time that area is
+touched, since at least some of that limitation may actually have been
+this same one-worker-thread bottleneck.
+
+Verified end to end: a real hang reproduced first (two zombie processes
+confirmed via `tasklist`, killed by hand), then a real fix confirmed --
+a 10,000-byte `strings.Reader` piped into `findstr.exe`'s real stdin two
+ways (`CombinedOutput()`, and explicit `Start`+`Stdout` capture+`Wait()`),
+byte-for-byte round trip, zero hang, process list clean afterward.
+`shim_sandbox` `ctest`: 2/2, unchanged after adding the mutex/pool --
+no regression from the new real locking.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
@@ -2126,7 +2190,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `net/textproto` | **in** (partial -- pure string/header handling, no `Conn`/`Pipeline`: `CanonicalMIMEHeaderKey`, `MIMEHeader` + free `Header{Get,Set,Add,Del,Values}` functions since methods need a struct receiver, `Reader.ReadLine`/`ReadMIMEHeader` with continuation-line folding) |
 | `net/url` | **in** (`QueryEscape`/`QueryUnescape`/`PathEscape`/`PathUnescape`, `URL` struct + `Parse`/`String`, `ParseQuery` -- no userinfo/port split, `ParseQuery` returns a flat `map[string]string` not real Go's multi-value `Values`) |
 | `os` | **in** (builtin: Args/Exit/Getenv/File/Stdout/Stdin/Stderr, `Stat`/`FileInfo`, `ReadDir`/`DirEntry` -- real directory listing via `<dirent.h>` opendir/readdir/closedir, genuine WASI `fd_readdir`, not a stub) + **rt** (Setenv/process still todo) |
-| `os/exec` | **in** (`Run`/`Output`/`CombinedOutput`/`Start`/`Wait` are all real via `gocvm.Call("os.exec"/"os.exec.start"/"wait"/"stdout.read", ...)` on a `goclang++.bat --shim-sandbox` build (real `CreateProcess`; `Start`+`Wait` stream real output into `Cmd.Stdout`/`Stderr` via a pump goroutine, see the GocVM diary entry above); plain wasm32-wasip1 still has no subprocess support, so those fall back to the same clear "not supported" error as before. `LookPath` stays stubbed -- no PATH-search topic exists yet; `Cmd.Stdin` is always wired to `NUL` (no interactive input) and stdout/stderr can't be separated (the real backend combines them into one pipe) |
+| `os/exec` | **in** (`Run`/`Output`/`CombinedOutput`/`Start`/`Wait` are all real via `gocvm.Call("os.exec"/"os.exec.start"/"wait"/"stdout.read"/"stdin.write"/"stdin.close", ...)` on a `goclang++.bat --shim-sandbox` build (real `CreateProcess`; `Start`+`Wait` stream real output into `Cmd.Stdout`/`Stderr` via a pump goroutine and real input out of `Cmd.Stdin` via a second, concurrent goroutine, see the GocVM diary entry above -- `CombinedOutput`/`Run`/`Output` route through `Start`+`Wait` instead of the one-shot `os.exec` topic whenever `Cmd.Stdin` is set, since that topic can't stream input during its single blocking call); plain wasm32-wasip1 still has no subprocess support, so those fall back to the same clear "not supported" error as before. `LookPath` stays stubbed -- no PATH-search topic exists yet; stdout/stderr still can't be separated (the real backend combines them into one pipe) |
 | `os/user` | **in** (`Current`/`Lookup`/`LookupId` are all real via `gocvm.Call("os.user", ...)` on a `goclang++.bat --shim-sandbox` build (real `GetUserNameW`/`LookupAccountNameW`/`LookupAccountSidW`+`NetUserGetInfo`, see the GocVM diary entry above); plain wasm32-wasip1 falls back to the same "not supported" error as before) |
 | `os/signal` | **in** (deliberate no-op, same honest-boundary shape as `os/exec`/`runtime` -- WASI preview1 delivers no signals to a wasm guest at all. `Notify`/`Stop`/`Ignore`/`Reset`; signals are a plain `int` (POSIX-numbered), not real Go's `os.Signal` interface, since `os` is a compiler builtin here. Found and fixed one more general compiler bug building this: `package signal` collided with the C standard library's global `signal()` -- same class of fix already applied to `log`/`rand`, extended to cover this name too) |
 | `path` | **in** (partial) |

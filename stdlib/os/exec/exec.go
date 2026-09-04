@@ -46,9 +46,10 @@ type Cmd struct {
 	Stderr io.Writer
 	Stdin  io.Reader
 
-	started  bool
-	handle   string
-	pumpDone chan bool
+	started   bool
+	handle    string
+	pumpDone  chan bool
+	stdinDone chan bool
 }
 
 func Command(name string, arg ...string) *Cmd {
@@ -112,7 +113,15 @@ func parseStartHandle(reply string) string {
 // (see shim_sandbox's docs/architecture.md), so unlike real Go's
 // os/exec, Output() below can't isolate stdout alone -- it returns the
 // same combined bytes CombinedOutput() does.
+//
+// When c.Stdin is set, the one-shot "os.exec" topic can't stream input
+// during its single blocking call, so this routes through Start+Wait
+// instead (the same path that already streams Stdin for c.Start()),
+// capturing output into a local buffer.
 func (c *Cmd) CombinedOutput() ([]byte, error) {
+	if c.Stdin != nil {
+		return c.combinedOutputWithStdin()
+	}
 	reply, err := gocvm.Call("os.exec", c.argv())
 	if err != nil {
 		if isNoBridge(err) {
@@ -128,6 +137,29 @@ func (c *Cmd) CombinedOutput() ([]byte, error) {
 		return []byte(out), errors.New("exit status " + strconv.Itoa(code))
 	}
 	return []byte(out), nil
+}
+
+type sliceWriter struct {
+	buf *[]byte
+}
+
+func (w *sliceWriter) Write(p []byte) (int, error) {
+	*w.buf = append(*w.buf, p...)
+	return len(p), nil
+}
+
+func (c *Cmd) combinedOutputWithStdin() ([]byte, error) {
+	var out []byte
+	savedStdout, savedStderr := c.Stdout, c.Stderr
+	c.Stdout = &sliceWriter{&out}
+	c.Stderr = nil
+	if err := c.Start(); err != nil {
+		c.Stdout, c.Stderr = savedStdout, savedStderr
+		return nil, err
+	}
+	err := c.Wait()
+	c.Stdout, c.Stderr = savedStdout, savedStderr
+	return out, err
 }
 
 func (c *Cmd) Output() ([]byte, error) {
@@ -160,11 +192,37 @@ func (c *Cmd) pump() {
 	c.pumpDone <- true
 }
 
+// writeStdin drains c.Stdin into the child's real stdin pipe (an
+// os.exec.start handle's stdin pipe -- see shim_sandbox's real_win.cc,
+// which wires stdin to NUL only for the one-shot Exec topic used by
+// CombinedOutput's no-Stdin path) until EOF, then closes the pipe so the
+// child sees its own EOF, matching real Go's Cmd.Wait semantics of
+// closing Stdin after copying finishes.
+func (c *Cmd) writeStdin() {
+	buf := make([]byte, 4096)
+	for {
+		n, rerr := c.Stdin.Read(buf)
+		if n > 0 {
+			reply, err := gocvm.Call("os.exec.stdin.write", c.handle+"\x1f"+string(buf[:n]))
+			if err != nil || isRealError(reply) {
+				break
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	gocvm.Call("os.exec.stdin.close", c.handle)
+	c.stdinDone <- true
+}
+
 // Start launches the command for real (goclang++.bat --shim-sandbox)
 // without waiting for it to exit. If Stdout or Stderr is set, a
 // background goroutine streams the child's combined output into it as
-// it arrives; Wait below joins that goroutine before returning so all
-// output is flushed first, matching real Go's Cmd.Wait semantics.
+// it arrives; if Stdin is set, a background goroutine streams it into
+// the child's real stdin pipe. Wait below joins both goroutines before
+// returning so all I/O is flushed first, matching real Go's Cmd.Wait
+// semantics.
 func (c *Cmd) Start() error {
 	reply, err := gocvm.Call("os.exec.start", c.argv())
 	if err != nil {
@@ -186,6 +244,10 @@ func (c *Cmd) Start() error {
 		c.pumpDone = make(chan bool, 1)
 		go c.pump()
 	}
+	if c.Stdin != nil {
+		c.stdinDone = make(chan bool, 1)
+		go c.writeStdin()
+	}
 	return nil
 }
 
@@ -195,6 +257,9 @@ func (c *Cmd) Wait() error {
 	}
 	if c.pumpDone != nil {
 		<-c.pumpDone
+	}
+	if c.stdinDone != nil {
+		<-c.stdinDone
 	}
 	reply, err := gocvm.Call("os.exec.wait", c.handle)
 	if err != nil {
