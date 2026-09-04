@@ -551,6 +551,17 @@ class Generator {
     std::string cont;
     bool is_loop = false;
     bool range_func = false;
+    // Only set on a range_func frame: the shared flag/value locals a
+    // `return` inside its yield lambda stashes into before stopping
+    // iteration (`return false`), so the real C++ return can happen once
+    // control is back at an ordinary statement position -- see
+    // EmitRangeFuncReturn/EmitRangeOverFunc's post-call check. A range_func
+    // frame nested inside another one inherits its nearest enclosing
+    // range_func frame's own vars instead of declaring fresh ones -- one
+    // shared escape path all the way out, matching real Go's own
+    // return-inside-range-over-func desugaring.
+    std::string rf_ret_var;
+    std::string rf_val_var;
   };
   std::vector<JumpFrame> jump_stack_;
   std::string pending_label_;
@@ -2750,12 +2761,17 @@ class Generator {
   // theirs (see EmitFprint's comment on why `os.Stdout`/`os.Stderr` must be
   // written directly, unaliased).
   std::string EmitFprintf(const std::vector<std::unique_ptr<Expr>>& args) {
-    if (args.size() < 2 || args[1]->kind != ExprKind::StringLit) {
-      Error("fmt.Fprintf's format string must be a string literal");
-    }
-    const std::string& fmt = args[1]->strval;
+    if (args.size() < 2) Error("fmt.Fprintf needs a writer and a format string");
     bool is_stdout = IsOsStreamSelector(*args[0], "Stdout");
     bool is_stderr = IsOsStreamSelector(*args[0], "Stderr");
+    if (args[1]->kind != ExprKind::StringLit) {
+      std::string call = EmitDynamicFormatCall(*args[1], args, 2);
+      if (is_stdout) return "(std::cout << " + call + ")";
+      if (is_stderr) return "(std::cerr << " + call + ")";
+      return "((" + EmitExpr(*args[0]) + ")" + WriteArrow(*args[0]) + "Write(wasigo::bytes_from_string(" +
+             call + ")))";
+    }
+    const std::string& fmt = args[1]->strval;
     std::ostringstream stream;
     if (is_stdout) {
       stream << "(std::cout";
@@ -2809,8 +2825,17 @@ class Generator {
   // %w (at most one) to wrap another error for errors.Is/Unwrap to walk --
   // see Error::wrapped_ in runtime.hpp.
   std::string EmitErrorf(const std::vector<std::unique_ptr<Expr>>& args) {
-    if (args.empty() || args[0]->kind != ExprKind::StringLit) {
-      Error("fmt.Errorf's format string must be a string literal");
+    if (args.empty()) Error("fmt.Errorf needs a format string");
+    if (args[0]->kind != ExprKind::StringLit) {
+      // No %w wrap-tracking here: which arg is the wrapped error depends
+      // on the runtime format string's own content, which codegen can't
+      // see. FormatPrintf renders a %w verb as plain text (the error's own
+      // message, via its ostream operator) so the message still reads
+      // right; errors.Is/Unwrap just won't walk into it. Wrapping with a
+      // dynamic format string would need parsing %w's position at
+      // runtime too -- not worth it for how rarely Errorf's format string
+      // is itself dynamic.
+      return "wasigo::errors_new(" + EmitDynamicFormatCall(*args[0], args, 1) + ")";
     }
     const std::string& fmt = args[0]->strval;
     std::ostringstream stream;
@@ -2869,9 +2894,43 @@ class Generator {
     return stream.str();
   }
 
+  // Builds `wasigo::FormatPrintf(fmtExpr, std::vector<wasigo::Any>{adapted
+  // args...})` for a Printf-family call whose format string isn't a
+  // compile-time literal, so the verb loop below (which walks the
+  // literal's actual characters at codegen time) has nothing to walk.
+  // Shared by EmitPrintf/EmitFprintf/EmitErrorf's non-literal branch.
+  // `...any` spread (`log.Printf`-shaped wrapper: `func Logf(format
+  // string, v ...any) { fmt.Printf(format, v...) }`) needs its own case --
+  // Go's own type system only allows spreading a `[]any` into `...any`
+  // here, so `v` is already `wasigo::Slice<wasigo::Any>` at the C++ level;
+  // boxing IT as a single `any` (what the plain per-arg loop below would
+  // do) would hand FormatPrintf one argument -- the whole boxed slice --
+  // instead of `v`'s own elements, silently producing wrong output rather
+  // than the intended per-element formatting.
+  std::string EmitDynamicFormatCall(const Expr& fmt_expr, const std::vector<std::unique_ptr<Expr>>& args,
+                                     size_t first_arg) {
+    std::ostringstream oss;
+    oss << "wasigo::FormatPrintf(" << EmitExpr(fmt_expr) << ", ";
+    if (args.size() == first_arg + 1 && args[first_arg] && args[first_arg]->ellipsis) {
+      oss << "wasigo::AnyVectorFromSlice(" << EmitExpr(*args[first_arg]) << ")";
+    } else {
+      oss << "std::vector<wasigo::Any>{";
+      for (size_t i = first_arg; i < args.size(); ++i) {
+        if (i > first_arg) oss << ", ";
+        if (args[i]->ellipsis) Error("cannot mix unpacked and individual variadic arguments");
+        oss << EmitAdapt(SynthNamed("any"), *args[i]);
+      }
+      oss << "}";
+    }
+    oss << ")";
+    return oss.str();
+  }
+
   std::string EmitPrintf(const std::vector<std::unique_ptr<Expr>>& args, bool to_stream) {
-    if (args.empty() || args[0]->kind != ExprKind::StringLit) {
-      Error("fmt.Printf/Sprintf's format string must be a string literal");
+    if (args.empty()) Error("fmt.Printf/Sprintf needs a format string");
+    if (args[0]->kind != ExprKind::StringLit) {
+      std::string call = EmitDynamicFormatCall(*args[0], args, 1);
+      return to_stream ? "(std::cout << " + call + ")" : call;
     }
     const std::string& fmt = args[0]->strval;
     std::ostringstream stream;
@@ -4279,10 +4338,68 @@ class Generator {
     }
   }
 
+  // `return` inside a range-over-func's loop body compiles to code running
+  // INSIDE the yield lambda passed to the sequence function -- a literal
+  // `return` there would return from that lambda (wrong type, wrong
+  // effect), not the enclosing Go function. Real Go's own compiler
+  // desugars this the same way: stash the value, stop iterating (`return
+  // false` from the yield), and do the real return once control is back
+  // at an ordinary statement, right after the sequence-function call
+  // returns (see EmitRangeOverFunc's post-call check, and
+  // JumpFrame::rf_ret_var/rf_val_var's own comment for how nesting shares
+  // one flag/value pair all the way out).
+  void EmitRangeFuncReturn(const Stmt& s, JumpFrame& rf) {
+    // main() returns `int` at the actual C++ level despite declaring no
+    // Go results (see EmitReturn's own IsMainFunc() special case) --
+    // ReturnCppType alone would say "void" and lose the implicit 0.
+    std::string rct = IsMainFunc() ? "int" : (current_func_ ? ReturnCppType(*current_func_) : "void");
+    if (rct != "void") {
+      std::string val_expr;
+      if (s.rhs.empty()) {
+        if (IsMainFunc()) {
+          val_expr = "0";
+        } else if (!in_func_lit_ && HasNamedResults(current_func_)) {
+          if (current_func_->results.size() == 1) {
+            val_expr = CppIdent(current_func_->result_names[0]);
+          } else {
+            std::ostringstream oss;
+            oss << "{";
+            for (size_t i = 0; i < current_func_->result_names.size(); ++i) {
+              if (i) oss << ", ";
+              const std::string& nm = current_func_->result_names[i];
+              oss << (nm.empty() || nm == "_" ? "{}" : CppIdent(nm));
+            }
+            oss << "}";
+            val_expr = oss.str();
+          }
+        } else {
+          val_expr = "{}";
+        }
+      } else if (s.rhs.size() == 1) {
+        const TypeNode* rt = CurrentResultCount() == 1 ? CurrentResultType(0) : nullptr;
+        val_expr = EmitExprAs(*s.rhs[0], rt);
+      } else {
+        std::ostringstream oss;
+        oss << "{";
+        for (size_t i = 0; i < s.rhs.size(); ++i) {
+          if (i) oss << ", ";
+          const TypeNode* rt = i < CurrentResultCount() ? CurrentResultType(i) : nullptr;
+          oss << EmitExprAs(*s.rhs[i], rt);
+        }
+        oss << "}";
+        val_expr = oss.str();
+      }
+      out_ << Indent() << rf.rf_val_var << " = " << val_expr << ";\n";
+    }
+    out_ << Indent() << rf.rf_ret_var << " = true;\n";
+    out_ << Indent() << "return false;\n";
+  }
+
   void EmitReturn(const Stmt& s) {
     for (auto it = jump_stack_.rbegin(); it != jump_stack_.rend(); ++it) {
       if (it->range_func) {
-        Error("return inside range-over-func is not supported");
+        EmitRangeFuncReturn(s, *it);
+        return;
       }
     }
     const char* kw = current_async_ ? "co_return" : "return";
@@ -4557,6 +4674,36 @@ class Generator {
       Error("range over seq yields one value");
     }
     jump_stack_.back().range_func = true;
+    // A `return` inside this loop's body needs somewhere to stash its
+    // value and a flag to stop iterating -- see EmitRangeFuncReturn's own
+    // comment. Nested inside another range-over-func, reuse ITS pair (one
+    // shared escape path, `return false` propagates outward one level at
+    // a time); otherwise this is the outermost one reachable, so declare
+    // a fresh pair right before the call. Copied into locals (not kept as
+    // a reference/pointer into jump_stack_) because EmitStmtList(s.body)
+    // below can push/pop that vector for nested loops, which may
+    // reallocate it.
+    bool is_nested_rf = false;
+    for (auto it = jump_stack_.rbegin() + 1; it != jump_stack_.rend(); ++it) {
+      if (it->range_func) {
+        is_nested_rf = true;
+        jump_stack_.back().rf_ret_var = it->rf_ret_var;
+        jump_stack_.back().rf_val_var = it->rf_val_var;
+        break;
+      }
+    }
+    std::string rct = IsMainFunc() ? "int" : (current_func_ ? ReturnCppType(*current_func_) : "void");
+    if (!is_nested_rf) {
+      std::string id = std::to_string(temp_id_++);
+      jump_stack_.back().rf_ret_var = "__rf_ret" + id;
+      out_ << Indent() << "bool " << jump_stack_.back().rf_ret_var << " = false;\n";
+      if (rct != "void") {
+        jump_stack_.back().rf_val_var = "__rf_val" + id;
+        out_ << Indent() << rct << " " << jump_stack_.back().rf_val_var << "{};\n";
+      }
+    }
+    std::string rf_ret_var = jump_stack_.back().rf_ret_var;
+    std::string rf_val_var = jump_stack_.back().rf_val_var;
     out_ << Indent() << range_src << "(" << CppType(yield) << "{[&](";
     for (size_t i = 0; i < yparams.size(); ++i) {
       if (i) out_ << ", ";
@@ -4586,6 +4733,29 @@ class Generator {
     out_ << Indent() << "return true;\n";
     indent_--;
     out_ << Indent() << "}});\n";
+    // Escape check: a `return` inside the loop stopped iteration and set
+    // rf_ret_var rather than actually returning (see EmitRangeFuncReturn).
+    // If this loop is itself nested inside another range-over-func, we're
+    // still lexically inside THAT one's yield lambda right here, so
+    // `return false` correctly stops it too, propagating the same check
+    // one level further out; otherwise this is the real function scope,
+    // so do the actual C++ return here.
+    if (!rf_ret_var.empty()) {
+      out_ << Indent() << "if (" << rf_ret_var << ") {\n";
+      indent_++;
+      if (is_nested_rf) {
+        out_ << Indent() << "return false;\n";
+      } else {
+        const char* kw = current_async_ ? "co_return" : "return";
+        if (rct == "void") {
+          out_ << Indent() << kw << ";\n";
+        } else {
+          out_ << Indent() << kw << " " << rf_val_var << ";\n";
+        }
+      }
+      indent_--;
+      out_ << Indent() << "}\n";
+    }
   }
 
   void EmitForRange(const Stmt& s) {

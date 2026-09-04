@@ -844,6 +844,51 @@ inline std::ostream& operator<<(std::ostream& os, const Any& a) {
   return os << "<any>";
 }
 
+// Runtime counterpart to EmitPrintf/EmitFprintf/EmitErrorf's compile-time
+// verb loop in cpp_generator.cc, used only when the format string itself
+// isn't a string literal -- codegen can't walk a runtime string's verbs
+// at compile time, so the args are boxed as `any` (wasigo::Any::adapt,
+// via EmitAdapt) and the verbs are walked here instead. Same %d/%s/%f/
+// %v/%t/%w streamed through Any's own operator<< (bool prints "true"/
+// "false", anything else uses its type's ostream operator -- see
+// Any::adapt), except %c, which wants an actual character code. A
+// missing argument or an unrecognized verb is printed back literally --
+// there's no compile-time call site left to reject at.
+inline std::string FormatPrintf(const std::string& fmt, const std::vector<Any>& args) {
+  std::ostringstream oss;
+  size_t argi = 0;
+  for (size_t i = 0; i < fmt.size(); ++i) {
+    if (fmt[i] == '%' && i + 1 < fmt.size()) {
+      char c = fmt[i + 1];
+      if (c == '%') {
+        oss << '%';
+        ++i;
+        continue;
+      }
+      if ((c == 'd' || c == 's' || c == 'f' || c == 'v' || c == 't' || c == 'w' || c == 'c') &&
+          argi < args.size()) {
+        const Any& a = args[argi++];
+        if (c == 'c') {
+          bool is_int = false;
+          switch (static_cast<RKind>(a.kind)) {
+            case RKind::Int8: case RKind::Int16: case RKind::Int32: case RKind::Int64:
+            case RKind::Uint8: case RKind::Uint16: case RKind::Uint32: case RKind::Uint64:
+              is_int = true; break;
+            default: break;
+          }
+          oss << static_cast<char>(is_int ? a.Int() : 0);
+        } else {
+          oss << a;
+        }
+        ++i;
+        continue;
+      }
+    }
+    oss << fmt[i];
+  }
+  return oss.str();
+}
+
 // Now that Any is complete, FieldInfo (forward-declared above so Any's
 // reflect_fields_fn member could name it) gets its real definition.
 struct FieldInfo {
@@ -1393,6 +1438,19 @@ inline bool Any::SetSlice(const Slice<Any>& elems) {
   v.reserve(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; i++) v.push_back(elems[i]);
   return slice_set_fn(self, v);
+}
+// A `...any` spread into a dynamic-format-string Printf/Sprintf/Fprintf/
+// Errorf call (`log.Printf`-shaped wrapper: `fmt.Printf(format, v...)`
+// where `v` is `[]any`) needs FormatPrintf's own `std::vector<Any>`, not
+// the `Slice<Any>` a variadic `...any` parameter is boxed as -- see
+// EmitDynamicFormatCall's own comment for why boxing `v` itself as one
+// `any` instead would silently format the wrong thing.
+inline std::vector<Any> AnyVectorFromSlice(const Slice<Any>& s) {
+  std::vector<Any> v;
+  int64_t n = s.len();
+  v.reserve(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; i++) v.push_back(s[i]);
+  return v;
 }
 inline int64_t len(const std::string& s) { return static_cast<int64_t>(s.size()); }
 template<class T, std::size_t N>

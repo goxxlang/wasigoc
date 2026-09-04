@@ -17,7 +17,7 @@ surfaced: [design-log.md](design-log.md) (tracker from
 
 | Package | In | Missing |
 | --- | --- | --- |
-| `fmt` | `Print`/`Println`/`Sprint`/`Sprintln`/`Printf`/`Sprintf`/`Errorf`/`Fprint*` | format string must be a **literal**; verbs `%d %s %f %v %t %c %w %%` only; no `Scan*` |
+| `fmt` | `Print`/`Println`/`Sprint`/`Sprintln`/`Printf`/`Sprintf`/`Errorf`/`Fprint*` (a non-literal format string, including a `log.Printf`-shaped `v ...any` wrapper, falls back to a runtime verb walk with no compile-time argument checking) | verbs `%d %s %f %v %t %c %w %%` only; `Errorf`'s `%w` only wraps with a literal format string; no `Scan*` |
 | `errors` | `New`, `Is`, `Unwrap`, `Join` | `As` |
 | `os` | `Args`, `Exit`, `Getenv`, `File` (`Open`/`Create`/`ReadFile`/`WriteFile`, `Read`/`Write`/`Close`), std streams, `Stat`/`FileInfo`, `ReadDir`/`DirEntry` (real, via `stat(2)`/`opendir`+`readdir`) | `Setenv`, process, `Remove`/`Mkdir` |
 | `reflect` | `TypeOf`/`ValueOf`, `Value`/`Type` (`Kind`/`Name`/`NumField`/`Field`/`FieldName`/`Interface`/`Int`/`Float`/`Bool`/`String`, `Set*`) | no Chan/Func Kind |
@@ -26,7 +26,7 @@ Host file I/O from a WASI guest should go through
 [shim_sandbox](https://github.com/goxxlang/shim_sandbox) `w2g::Shim`
 (compile-time ABAC), not ambient `fopen`.
 
-## Honest stubs (WASI cannot do this)
+## What WASI cannot do
 
 These compile and return a clear error. They are the terminal shape,
 not a todo: `os/exec`, `os/user`, `net.Dial` to a real host (loopback

@@ -1817,6 +1817,81 @@ and left both fields at zero, now returns `nil` with both fields
 correctly populated (compiled and run directly, not via a golden test).
 Full `ctest` re-run for regressions.
 
+**Same day, later still -- two claimed-permanent language restrictions
+actually fixed for real: a non-literal `fmt.Printf`/`Sprintf`/`Fprintf`/
+`Errorf` format string, and `return` inside range-over-func.** Both had
+stood as documented walls (see this file's "Supported"/limits section
+and `docs/language.md`) for long enough that a claim they'd been fixed
+was checked directly against the running `src/` source (parser.cc:1649,
+cpp_generator.cc's `EmitPrintf`/`EmitReturn`, `runtime.hpp`) before doing
+anything else -- both restrictions were still genuinely enforced in the
+code, not just stale docs. Implemented both:
+
+*Non-literal format string*: `EmitPrintf`/`EmitFprintf`/`EmitErrorf`
+already parse a literal format string's own verbs at compile time
+(unchanged, still the fast/checked path). When the format expression
+isn't a `StringLit`, they now emit a call to a new runtime
+`wasigo::FormatPrintf(fmt, std::vector<Any>)` instead of erroring --
+each remaining arg gets boxed via the existing `EmitAdapt`/`Any::adapt`
+machinery, and `FormatPrintf` walks `%d %s %f %v %t %c %w %%` at runtime
+the same way the compile-time loop does, streaming each `Any` through
+its own `operator<<`. `Errorf`'s `%w` in this path renders as plain text
+(no wrap tracking -- which arg is `%w` depends on the runtime string's
+own content, not something codegen can see) rather than erroring, a
+real documented narrowing not silently dropped. First attempt missed the
+actual motivating case entirely: a `log.Printf`-shaped wrapper
+(`func Logf(format string, v ...any) { fmt.Printf(format, v...) }`)
+compiled and RAN, but silently produced wrong output (`a=<any> b=%s`
+instead of `a=5 b=hi`) -- the `v...` spread was being boxed as ONE `any`
+(the whole `Slice<Any>`) instead of being expanded into its own
+elements, since the per-arg loop had no special case for `ellipsis`.
+Caught by testing that exact scenario, not by review. Fixed with a new
+`wasigo::AnyVectorFromSlice(const Slice<Any>&)` and an explicit
+`args.back()->ellipsis` check in the new `EmitDynamicFormatCall`,
+mirroring the existing ordinary-variadic-call spread handling. Landed
+`log.Printf`/`Fatalf`/`Panicf` in `stdlib/log` on top of this, the
+concrete case that had been cited as categorically impossible.
+
+*`return` inside range-over-func*: a range-over-func loop's body compiles
+to code running inside the yield lambda passed to the sequence function
+(`EmitRangeOverFunc`) -- a literal `return` there would return from that
+lambda (wrong type, wrong effect), which is exactly why this used to be
+a hard `Error()`. Fixed the way real Go's own compiler desugars this:
+`JumpFrame` gained `rf_ret_var`/`rf_val_var` string fields; the
+OUTERMOST range-over-func loop reachable declares a fresh `bool` flag
+(and, unless the enclosing function returns nothing, a value slot typed
+via `ReturnCppType`) right before its own call; a `return` inside (found
+by `EmitReturn` walking `jump_stack_` for the nearest `range_func`
+frame) stashes its value into that slot and does `return false;` to stop
+iterating instead of a real C++ return; right after each range-over-func
+call, a check sees whether the flag got set and, if this loop is itself
+nested inside another one, propagates by doing the SAME `return false;`
+(we're still lexically inside that outer yield lambda) -- only the
+actual outermost level does the real C++ `return`/`co_return`. One
+shared flag/value pair per outermost loop, inherited (not
+re-declared) by anything nested inside it, so arbitrarily deep nesting
+escapes one level at a time. `main()`'s implicit `int` return (despite
+declaring zero Go results) is special-cased the same way `EmitReturn`'s
+own bare-`return` branch already does. A real lifetime hazard avoided
+during implementation: the post-call check originally held a
+`JumpFrame&`/pointer taken before emitting the loop body, but
+`EmitStmtList(s.body)` can push/pop `jump_stack_` (a `std::vector`) for
+nested loops, which can reallocate it -- switched to copying the two
+variable-name strings into locals before emitting the body, used after.
+
+Verified end to end, not just "compiles": `fmt.Sprintf`/`Printf`/
+`Errorf` with a variable format string; the exact `log.Printf`-shaped
+wrapper scenario (both the broken-before-the-ellipsis-fix output and the
+corrected `a=5 b=hi` after); a single-level range-over-func `return`
+(`for v := range Seq { if v > n { return v } }`); and a NESTED
+range-over-func `return` (`for a := range Seq { for b := range Seq { if
+a+b==7 { return a*100+b } } }`, confirming propagation through two
+levels lands the right value, not just stops the inner loop). Full
+`ctest`: 283/283, both before and after the `ellipsis` fix (the broken
+intermediate state was caught by manual testing, never by `ctest` --
+existing goldens don't happen to exercise this exact spread shape,
+worth remembering if this code is touched again).
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
@@ -1922,7 +1997,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `io` | **in** (partial) |
 | `io/ioutil` | **in** (deprecated in real Go too -- `ReadAll`/`ReadFile`/`WriteFile` as direct pass-throughs to `io`/`os`. Not implemented: `ReadDir`/`TempFile`/`TempDir` (no directories or temp-file support in this project's `os`), `NopCloser` (needs `io.ReadCloser`, not added yet)) |
 | `io/fs` | **in** (bounded: `FS`/`File`/`FileInfo` interfaces, `ValidPath`, generic `ReadFile`/`Stat` helpers operating on any caller-provided `FS` -- still no os-backed FS (an `os.DirFS`-equivalent wrapping `os.Stat`/`os.ReadDir`, which now exist -- see `os`'s own tracker line -- has not been built); no `ReadDir`/`Glob`/`WalkDir`/`Sub`, which would need a directory-bearing FS to exercise against (`path/filepath`'s own `WalkDir` -- see its tracker line -- is a separate, `os`-only implementation, not built on `io/fs.FS`). `FileMode` is a plain `uint32` (matching real Go's own underlying type) with no methods, same struct-receiver-only bound as `time.Duration` -- `IsDir` lives on `FileInfo` instead, matching real Go's own shape. Verified with an in-memory map-backed `FS` implementation: `ReadFile`/`Stat` through the interface, a not-found path, and `ValidPath` against 7 cases including the "." special case, leading/trailing slash, doubled slash, and a ".." element) |
-| `log` | **in** (Print/Println/Fatal/Fatalln/Panic/Panicln only -- no `*f`, see stdlib/log) |
+| `log` | **in** (Print/Println/Fatal/Fatalln/Panic/Panicln plus Printf/Fatalf/Panicf, forwarding straight to `fmt.Printf`/`Sprintf`'s non-literal-format-string path -- see stdlib/log) |
 | `log/slog` | **in** (bounded: a single concrete text-format `Logger`, no pluggable `Handler` interface, no `Group`/`LogAttrs`. `Level`/`LevelDebug`..`LevelError`, `LevelString` -- not a `Level.String()` method, same struct-receiver-only limitation as `time.Duration` -- `New`/`SetLevel`/`Debug`/`Info`/`Warn`/`Error`, package-level default-logger functions + `SetDefault`) |
 | `log/syslog` | n/a |
 | `maps` | **in** (pre-1.23 slice-returning shape -- no `iter.Seq`, this compiler has no range-over-func) |

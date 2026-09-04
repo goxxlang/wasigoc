@@ -77,8 +77,12 @@ literals (`4i`).
 Builtins: `len`/`cap`/`append`/`copy`/`make`/`new`/`close`/`delete`/
 `panic`/`recover`/`min`/`max`/`clear`, `real`/`imag`/`complex`, method values, array slicing
 (copies into a `Slice`), numeric/`string` conversions.
-`fmt.Print*`/`Sprint*`/`Printf`/`Sprintf` (format string must be a
-**literal**; verbs `%d %s %f %v %t %c %%` only, no width/precision).
+`fmt.Print*`/`Sprint*`/`Printf`/`Sprintf` (verbs `%d %s %f %v %t %c %%`
+only, no width/precision). A literal format string is checked and
+verb-expanded at compile time; a non-literal one (including a
+`log.Printf`-shaped wrapper forwarding `v ...any`) falls back to a
+runtime formatter (`wasigo::FormatPrintf`) with the same verbs, but no
+compile-time argument-count/verb checking.
 `errors.New` / `errors.Is` (`errors.New("")` is still non-nil).
 
 Methods exist on structs and on defined types (`type Duration int64`
@@ -143,11 +147,12 @@ wasigoc examples/modnest/main.go -o modnest.cpp --out-dir gen/
 
 - `recover()` does not unwind across calls.
 - Ordinary func literals capture `[&]`; `go` captures by value.
-- `fmt.Printf` format must be a string literal at the call site — no
-  `log.Printf`-shaped wrappers.
+- A non-literal `fmt.Printf`/`Sprintf`/`Fprintf`/`Errorf` format string
+  works (see above) but skips compile-time verb/argument-count checking,
+  and `Errorf`'s `%w` (error-wrapping for `errors.Is`/`Unwrap`) only
+  works with a literal format string — a dynamic one renders `%w` as
+  plain text instead of wrapping.
 - `uintptr` is `uint64` (same width as `uint`).
 - `//go:embed` is not generated (`embed.FS` returns a clear
   "not supported" error rather than faking a read).
-- Range-over-func does not support `return` from inside the loop body
-  (break/continue are fine).
 - Generic interfaces (`type I[T any] interface`) are not generated.

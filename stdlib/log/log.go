@@ -2,11 +2,6 @@
 // README's stdlib tracker) and no *Logger type -- just the package-level
 // funcs, writing to stdout (os.Stdout isn't wired up as an io.Writer yet
 // either, so real Go's stderr default isn't available).
-//
-// No Printf/Fatalf/Panicf: fmt.Printf/Sprintf's format string is parsed at
-// wasigoc *compile* time and must be a string literal at that call site --
-// a `format string` parameter forwarded from a caller can never satisfy
-// that, so there is no way to build a Printf-shaped wrapper at all here.
 package log
 
 import (
@@ -43,6 +38,19 @@ func Fatalln(v ...any) {
 	os.Exit(1)
 }
 
+// Printf/Fatalf/Panicf forward format+v straight to fmt.Printf/Sprintf,
+// which support a non-literal (parameter) format string via a runtime
+// verb walk -- see docs/language.md's "Limits worth knowing" for what
+// that path doesn't check at compile time.
+func Printf(format string, v ...any) {
+	fmt.Printf(format, v...)
+}
+
+func Fatalf(format string, v ...any) {
+	fmt.Printf(format, v...)
+	os.Exit(1)
+}
+
 func sprintAll(v []any) string {
 	s := ""
 	for i, x := range v {
@@ -60,4 +68,8 @@ func Panic(v ...any) {
 
 func Panicln(v ...any) {
 	panic(sprintAll(v) + "\n")
+}
+
+func Panicf(format string, v ...any) {
+	panic(fmt.Sprintf(format, v...))
 }
