@@ -612,6 +612,7 @@ enum class RKind : int {
 };
 
 struct FieldInfo;  // defined after Any -- see the forward-declaration note below
+template <class T> struct Slice;  // defined later -- Any::SetSlice takes Slice<Any>
 
 // A struct's per-field description, emitted by cpp_generator.cc right
 // after the struct's own definition as a free function ADL-findable from
@@ -701,6 +702,15 @@ struct Any {
   void (*reflect_fields_fn)(const std::shared_ptr<void>&, std::vector<FieldInfo>&) = nullptr;
   int64_t (*slice_len_fn)(const std::shared_ptr<void>&) = nullptr;
   Any (*slice_index_fn)(const std::shared_ptr<void>&, int64_t) = nullptr;
+  // Replaces the whole slice this Value was adapt_ptr'd from with a
+  // freshly built one containing `elems`, coercing each element from
+  // its own (JSON-decoder-shaped: float64/bool/string/nested Any tree)
+  // boxing into this slice's real element type -- returns false rather
+  // than panicking for an element kind it doesn't know how to coerce
+  // (a struct or another slice; see the SetSlice-vs-finish_any_kind
+  // comment below), so callers like encoding/json can surface a real
+  // Go error for that instead of aborting.
+  bool (*slice_set_fn)(const std::shared_ptr<void>&, const std::vector<Any>&) = nullptr;
   bool is_nil() const { return !self; }
   template<class T>
   static Any adapt(T v) {
@@ -817,6 +827,10 @@ struct Any {
   void SetFloat(double n);
   void SetBool(bool b);
   void SetString(const std::string& s);
+  // Unlike SetInt/SetString etc, doesn't panic: encoding/json needs to
+  // turn "an element wasn't a scalar this slice's type accepts" into a
+  // real Go error, not an abort, for a slice deep inside a larger struct.
+  bool SetSlice(const Slice<Any>& elems);
   int64_t Len() const;
   Any Index(int64_t i) const;
 };
@@ -914,6 +928,7 @@ inline Any Any::Index(int64_t i) const {
   panic("reflect: Index on a non-slice Value");
   return {};
 }
+// Any::SetSlice is defined after Slice<T> itself, below.
 
 // func values without <functional> (that header pulls a broken <cctype> on
 // wasi-sdk noeh). Same virtual type-erasure as DeferList.
@@ -1230,6 +1245,7 @@ class Persistent : public PersistentBase {
 
 template<class T>
 struct Slice {
+  using value_type = T;
   std::shared_ptr<std::vector<T>> buf;
   std::size_t off = 0;
   std::size_t len_ = 0;
@@ -1310,9 +1326,40 @@ struct is_wasigo_slice : std::false_type {};
 template <class T>
 struct is_wasigo_slice<Slice<T>> : std::true_type {};
 
+// JSON-decoder-shaped coercion: encoding/json's generic value tree
+// always boxes a decoded number as float64, a string as std::string, a
+// bool as bool (mirroring decodeReflect's own per-scalar-kind checks in
+// stdlib/encoding/json/json.go) -- this is the same coercion, just for
+// one of a slice's elements instead of a single struct field, and
+// generic at the C++ level since Elem varies per instantiation. False
+// (does not touch *out) for anything else -- SetSlice below turns that
+// into a real Go error rather than an abort, so a slice of struct or a
+// nested slice is a clear "not supported yet" instead of a crash.
+template <class Elem>
+bool try_coerce_json_any(const Any& a, Elem* out) {
+  if constexpr (std::is_same_v<Elem, std::string>) {
+    if (static_cast<RKind>(a.kind) != RKind::String || !a.self) return false;
+    *out = *static_cast<const std::string*>(a.self.get());
+    return true;
+  } else if constexpr (std::is_same_v<Elem, bool>) {
+    if (static_cast<RKind>(a.kind) != RKind::Bool || !a.self) return false;
+    *out = *static_cast<const bool*>(a.self.get());
+    return true;
+  } else if constexpr (std::is_integral_v<Elem> || std::is_floating_point_v<Elem>) {
+    // Go JSON numbers are always float64 in the generic decode shape,
+    // regardless of the target element's own numeric type.
+    if (static_cast<RKind>(a.kind) != RKind::Float64 || !a.self) return false;
+    *out = static_cast<Elem>(*static_cast<const double*>(a.self.get()));
+    return true;
+  } else {
+    return false;
+  }
+}
+
 template <class T>
 inline void finish_any_kind(Any& a) {
   if constexpr (is_wasigo_slice<T>::value) {
+    using Elem = typename T::value_type;
     a.kind = static_cast<int>(RKind::Slice);
     a.slice_len_fn = +[](const std::shared_ptr<void>& self) -> int64_t {
       if (!self) return 0;
@@ -1322,7 +1369,30 @@ inline void finish_any_kind(Any& a) {
       auto* sl = static_cast<T*>(self.get());
       return Any::adapt((*sl)[i]);
     };
+    a.slice_set_fn = +[](const std::shared_ptr<void>& self, const std::vector<Any>& elems) -> bool {
+      if (!self) return false;
+      std::vector<Elem> vec;
+      vec.reserve(elems.size());
+      for (const auto& e : elems) {
+        Elem v{};
+        if (!try_coerce_json_any<Elem>(e, &v)) return false;
+        vec.push_back(std::move(v));
+      }
+      auto* sl = static_cast<T*>(self.get());
+      sl->buf = std::make_shared<std::vector<Elem>>(std::move(vec));
+      sl->off = 0;
+      sl->len_ = sl->buf->size();
+      return true;
+    };
   }
+}
+inline bool Any::SetSlice(const Slice<Any>& elems) {
+  if (!slice_set_fn || !self) return false;
+  std::vector<Any> v;
+  int64_t n = elems.len();
+  v.reserve(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; i++) v.push_back(elems[i]);
+  return slice_set_fn(self, v);
 }
 inline int64_t len(const std::string& s) { return static_cast<int64_t>(s.size()); }
 template<class T, std::size_t N>

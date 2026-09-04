@@ -64,6 +64,36 @@ Typical bounds, also in each package comment:
 - `sync`: no-op mutexes; `WaitGroup.Wait` cannot block the runqueue.
 - `time.Sleep`: no-op (must not block the cooperative scheduler).
 
+## Extensions beyond `go list std`
+
+`stdlib/unil` is not part of real Go's standard library — it's the
+WASMUniLoader "unil" bill-of-materials format (files, runtime
+components, capabilities, canonical JSON, SHA-256 digest, Ed25519
+signing), a Go++ port of `~/WASMUniLoader/cpp/src/sbom.cc`'s C++ core
+so a Go++ program can produce and verify byte-identical documents
+without linking that C++ code. `import "unil"` resolves the same way
+any stdlib package does (`wasigoc` searches `stdlib/` regardless of
+whether the import path is real Go). See its package doc comment and
+[design-log.md](design-log.md)'s tracker entry.
+
+`stdlib/guac` builds on it: the on-disk shape of a distributable Go++
+wasm package — a directory with compiled wasm file(s) plus a
+`guac.json` manifest, which is an ordinary `unil.Document` (no schema
+changes, just two naming conventions — see its package doc comment).
+`HashFile`/`BuildManifest` hash files already on disk; `WriteManifest`/
+`ReadManifest` persist and reload the manifest; `Verify` catches drift
+between a directory and its manifest. It does not create directories
+(no `Mkdir` in this `os`), compile anything, or fetch a dependency —
+a `guac` CLI wrapping `wasigoc`/`goclang++` builds around this layer
+doesn't exist yet.
+
+Building it surfaced a real, previously-latent bug in
+`crypto/ed25519`: the `dEd` curve constant had a digit transcription
+error, so the compiled-in base point never actually satisfied the
+curve equation — invisible until something did a genuine external
+Sign-then-Verify round trip, which no existing golden did. Fixed; see
+the tracker entry for `crypto/ed25519`.
+
 ## Growing it
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md). Tick the tracker in the

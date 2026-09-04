@@ -326,6 +326,12 @@ File BuildReflectBuiltinFile() {
     v.push_back(std::move(p));
     return v;
   };
+  auto anySlice = [] {
+    auto t = std::make_unique<TypeNode>();
+    t->kind = TypeKind::Slice;
+    t->elem = MakeNamedType("any");
+    return t;
+  };
   auto method = [&](const char* recv_type, const char* name, std::vector<Param> params,
                      std::unique_ptr<TypeNode> result) {
     FuncDecl m;
@@ -357,6 +363,7 @@ File BuildReflectBuiltinFile() {
   method("Value", "SetFloat", params1(param("n", MakeNamedType("float64"))), nullptr);
   method("Value", "SetBool", params1(param("b", MakeNamedType("bool"))), nullptr);
   method("Value", "SetString", params1(param("s", MakeNamedType("string"))), nullptr);
+  method("Value", "SetSlice", params1(param("elems", anySlice())), MakeNamedType("bool"));
   method("Value", "Len", {}, MakeNamedType("int"));
   method("Value", "Index", params1(param("i", MakeNamedType("int"))), MakeNamedType("Value", "reflect"));
 

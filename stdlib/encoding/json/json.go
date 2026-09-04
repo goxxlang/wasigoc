@@ -333,6 +333,16 @@ func decodeReflect(rv reflect.Value, src any) error {
 		rv.SetFloat(f)
 		return nil
 	}
+	if k == reflect.Slice {
+		arr, ok := src.([]any)
+		if !ok {
+			return errors.New("json: cannot unmarshal into slice field")
+		}
+		if !rv.SetSlice(arr) {
+			return errors.New("json: unsupported slice element type in Unmarshal target")
+		}
+		return nil
+	}
 	return errors.New("json: unsupported Unmarshal target (struct pointer, *any, " +
 		"*map[string]any, *[]any, *string, *float64, *bool)")
 }

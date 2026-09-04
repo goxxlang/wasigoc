@@ -1781,6 +1781,42 @@ array type with a method. Full `ctest` (both repos): 279/279, including
 `typedecl_golden`/`jpegpkg_golden` themselves confirming the earlier
 copy-vs-reference regression is gone.
 
+**Same day, one more round -- `encoding/json` can Unmarshal into a
+slice-typed struct field.** `Marshal` of a struct with a slice or
+named-slice field (`Wrapper{Items IntList, Names []string}`) already
+worked, via the existing `finish_any_kind<T>`/`is_wasigo_slice<Slice<T>>`
+mechanism. `Unmarshal` back into the same struct did not: `decodeReflect`
+in `stdlib/encoding/json/json.go` had no `reflect.Slice` case at all, so
+it fell through to the generic "unsupported Unmarshal target" error --
+and because a struct's field loop returns on the FIRST field error, one
+unsupported slice field killed decoding of every other field in the
+struct too, not just its own.
+
+Fixed with the same shape `SetInt`/`SetString`/etc already use: a new
+`Any::slice_set_fn` function pointer (populated in `finish_any_kind<T>`
+alongside the existing `slice_len_fn`/`slice_index_fn`, using
+`typename T::value_type` as the element type -- `Slice<T>` gained a
+`value_type` alias for this) and a public `Any::SetSlice(const
+Slice<Any>&)` wired to it, exposed to Go as `reflect.Value.SetSlice(elems
+[]any) bool`. Unlike `SetInt`/etc, it returns `false` instead of
+panicking on failure, since `encoding/json` needs to turn "an element
+wasn't a scalar this slice's type accepts" into a real Go error for one
+field deep inside a larger struct, not an abort of the whole program.
+Element coercion (`try_coerce_json_any<Elem>`) mirrors `decodeReflect`'s
+own per-kind checks, just done once per slice element at the C++ level:
+JSON's generic decode shape always boxes a number as `float64`, so an
+`int`/`int64`/`float32` slice element all coerce from the same
+`RKind::Float64` box. Deliberately out of scope: a slice of structs or a
+slice of slices -- `try_coerce_json_any` returns `false` for both,
+surfacing as a real `json: unsupported slice element type` error rather
+than a crash.
+
+Verified: a `Wrapper{Items IntList, Names []string}` round trip through
+`Marshal`+`Unmarshal` -- previously `Unmarshal` returned a non-nil error
+and left both fields at zero, now returns `nil` with both fields
+correctly populated (compiled and run directly, not via a golden test).
+Full `ctest` re-run for regressions.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
@@ -1808,8 +1844,9 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `crypto/dsa` | **in** (bounded textbook SignRaw/VerifyRaw with a caller-supplied k, same "no GenerateKey" shape as crypto/rsa. Verified with a tiny p=23/q=11/g=2 vector) |
 | `crypto/ecdh` | **in** (P-256 SharedSecret = x(priv*peer); Alice/Bob symmetry verified with small scalars) |
 | `crypto/ecdsa` | **in** (P-256 SignRaw with caller-supplied k + Verify. Sign/Verify round trip with small d/k/hash) |
-| `crypto/ed25519` | **in** (RFC 8032 Sign/Verify via math/big field arithmetic -- slow, correct. `ed25519pkg`'s golden only covers sizes and reject-short-sig, since a full scalar-mult round trip was believed too expensive for the decimal-limb Int at this size -- that belief hid a real bug: the `dEd` twisted-Edwards curve constant had a transcription error in its low digits (`...085989429717` instead of the correct `...085940283555`, i.e. `-121665/121666 mod p`), so the compiled-in base point never actually satisfied the curve equation. `ptAdd`/`scalarMult` were internally self-consistent (Sign and Verify each independently correct relative to the wrong curve), which is exactly why the discrepancy stayed invisible without an external Sign-then-Verify check. Found while building `guac` (below), which needed real signing; fixed by correcting the constant. A genuine full keygen/sign/verify/tamper-reject round trip is now exercised by `guacpkg`'s golden and does complete, just slowly (tens of seconds at `-O2` native; budget accordingly for anything that calls `Sign`/`Verify`/`PublicKey` more than a couple of times) |
-| `guac` (not `go list std` -- project extension) | **in** (`stdlib/guac`: the "unil" bill-of-materials format, a Go++ port of `~/WASMUniLoader/cpp/src/sbom.cc`'s C++ core -- File/Component/Signature/Document, canonical JSON matching that C++ writer byte-for-byte including its partial-indent quirk, SHA-256 digest, Ed25519 sign/verify of documents and detached bytes, JSON parse via `encoding/json`'s generic `map[string]any` tree (its struct-Unmarshal path doesn't walk slice fields, so `Document` is assembled by hand from that tree -- same shape as sbom.cc's own tiny `J` parser), and an `Execute(cmd string)` JSON-in/JSON-out dispatcher mirroring sbom.cc's `execute()` (sandbox/bundle/canonical/digest/sign/verify/keygen/signbytes/verifybytes -- no `embeddedSandbox`, since this package has no baked-in WASMUniLoader wasm hashes to fall back to). Private keys are 64 bytes everywhere (32-byte seed \|\| 32-byte public, matching the C++ core and real Go's own `ed25519.PrivateKey` layout); only the seed half is passed to `ed25519.Sign`. `guacpkg`'s golden is a full round trip: build a sandbox+bundle document, digest it, generate a keypair, sign and verify the document, stringify then re-parse it and verify again, sign and verify detached bytes, and confirm tampered bytes are rejected) |
+| `crypto/ed25519` | **in** (RFC 8032 Sign/Verify via math/big field arithmetic -- slow, correct. `ed25519pkg`'s golden only covers sizes and reject-short-sig, since a full scalar-mult round trip was believed too expensive for the decimal-limb Int at this size -- that belief hid a real bug: the `dEd` twisted-Edwards curve constant had a transcription error in its low digits (`...085989429717` instead of the correct `...085940283555`, i.e. `-121665/121666 mod p`), so the compiled-in base point never actually satisfied the curve equation. `ptAdd`/`scalarMult` were internally self-consistent (Sign and Verify each independently correct relative to the wrong curve), which is exactly why the discrepancy stayed invisible without an external Sign-then-Verify check. Found while building `unil` (below), which needed real signing; fixed by correcting the constant. A genuine full keygen/sign/verify/tamper-reject round trip is now exercised by `unilpkg`'s golden and does complete, just slowly (tens of seconds at `-O2` native; budget accordingly for anything that calls `Sign`/`Verify`/`PublicKey` more than a couple of times) |
+| `unil` (not `go list std` -- project extension) | **in** (`stdlib/unil`: the "unil" bill-of-materials format, a Go++ port of `~/WASMUniLoader/cpp/src/sbom.cc`'s C++ core -- File/Component/Signature/Document, canonical JSON matching that C++ writer byte-for-byte including its partial-indent quirk, SHA-256 digest, Ed25519 sign/verify of documents and detached bytes, JSON parse via `encoding/json`'s generic `map[string]any` tree (its struct-Unmarshal path doesn't walk slice fields, so `Document` is assembled by hand from that tree -- same shape as sbom.cc's own tiny `J` parser), and an `Execute(cmd string)` JSON-in/JSON-out dispatcher mirroring sbom.cc's `execute()` (sandbox/bundle/canonical/digest/sign/verify/keygen/signbytes/verifybytes -- no `embeddedSandbox`, since this package has no baked-in WASMUniLoader wasm hashes to fall back to). Private keys are 64 bytes everywhere (32-byte seed \|\| 32-byte public, matching the C++ core and real Go's own `ed25519.PrivateKey` layout); only the seed half is passed to `ed25519.Sign`. `unilpkg`'s golden is a full round trip: build a sandbox+bundle document, digest it, generate a keypair, sign and verify the document, stringify then re-parse it and verify again, sign and verify detached bytes, and confirm tampered bytes are rejected) |
+| `guac` (not `go list std` -- project extension) | **in**, on-disk shape only (`stdlib/guac`: the on-disk shape of a distributable Go++ wasm package, built on `unil` above -- a directory holding compiled wasm file(s) plus a `guac.json` manifest, which is an ordinary `unil.Document` with no schema changes (byte-compatible, every `unil.*` function applies unchanged), just two conventions: `Scope` is `"package"` (unil itself only ever writes `"sandbox"`/`"bundle"`), and `Name` is `"<import path>@<version>"` (`PackageName` splits it back), `Capabilities` holds exactly the build target triple (`Target`), and `Runtime` lists dependencies as `unil.Component{Role: "depends"}` (`Depend`) -- name, fetch origin, and the dependency's own manifest digest for pinning, the same name+hash-pinning shape `unil.Component` already had, just a new `Role`. `HashFile`/`BuildManifest` hash files already on disk (SHA-256 via `crypto/sha256`, CRC-32 via `hash/crc32.ChecksumIEEE` formatted big-endian-hex to match `crc32Hex` in WASMUniLoader/cpp/src/crc32.cc exactly, not byte-order hex-encoded); `WriteManifest`/`ReadManifest` are `os.WriteFile`/`os.ReadFile` plus `unil.Stringify`/`unil.ParseDocument`; `Verify` re-hashes a directory's files against a manifest and catches drift, independent of (and orthogonal to) checking the manifest's signature via `unil.VerifyDocument`. Deliberately does NOT create directories (Go++'s `os` builtin has no `Mkdir`), compile anything, or fetch a dependency -- that's a future `guac` CLI wrapping `wasigoc`/`goclang++` builds around this manifest layer. `guacpkg`'s golden: write a fake wasm file, build+write+read a manifest, verify it, tamper the file and confirm `Verify` catches it, then sign the same manifest with `unil.SignDocument`/`unil.VerifyDocument` unchanged to prove the two packages compose) |
 | `crypto/elliptic` | **in** (NIST P-256 affine, IsOnCurve/Add/ScalarMult/ScalarBaseMult. G is on the curve; 1*G == G) |
 | `crypto/rand` | **in** (Reader/Read fill from math/rand's time-seeded xorshift -- NOT a CSPRNG, same honest caveat as math/rand. Wiring WASI random_get would need a compiler builtin like time.Now) |
 | `crypto/sha3` | **in** (SHA3-256 only, FIPS 202 Keccak sponge, domain 0x06. Verified against the empty-string and "abc" FIPS 202 vectors) |
@@ -1839,7 +1876,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `encoding/base64` | **in** (`StdEncoding`/`URLEncoding`, standard padding only) |
 | `encoding/hex` | **in** |
 | `encoding/binary` | **in** (`LittleEndian`/`BigEndian` Uint16/32/64 get/put/append) |
-| `encoding/json` | **in** (`Marshal`/`Unmarshal` for the *generic* decoded-JSON value shape -- `any`/`map[string]any`/`[]any`/`string`/`float64`/`bool` -- PLUS `Marshal` for arbitrary structs via `reflect`; `Unmarshal` into a struct still isn't supported, that needs settable reflect Values) |
+| `encoding/json` | **in** (`Marshal`/`Unmarshal` for the *generic* decoded-JSON value shape -- `any`/`map[string]any`/`[]any`/`string`/`float64`/`bool` -- PLUS `Marshal`/`Unmarshal` for arbitrary structs via `reflect`, including nested struct fields and fields typed as a slice or a named slice type of scalars (`reflect.Value.SetSlice`); a slice-of-structs or nested-slice-typed field still isn't a settable target) |
 | `encoding/csv` | **in** (RFC 4180: quoted fields, embedded commas/newlines, doubled-quote escaping, `Comment`/blank-line skipping, `FieldsPerRecord` enforcement, `TrimLeadingSpace`; `Comma`/`Comment` are ASCII bytes, not runes -- multi-byte delimiters unsupported. `Reader` slurps its whole input via `io.ReadAll` rather than streaming) |
 | `encoding/base32` | **in** (RFC 4648: standard and hex alphabets, standard padding only; verified against the RFC's own section-10 test vectors for both alphabets, plus a longer round trip) |
 | `encoding/pem` | **in** (RFC 1421-shaped blocks: `Decode`/`Encode`/`EncodeToMemory`. Bounded: header values are single-line only, no RFC 1421 continuation-line folding. Found and fixed a real, general compiler bug building this -- see the compiler-bugs writeup) |
