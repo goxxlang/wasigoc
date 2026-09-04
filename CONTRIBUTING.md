@@ -65,5 +65,6 @@ module.
 ## Style
 
 Match surrounding Go++: no methods on non-struct defined types, no
-Printf wrappers whose format string is a parameter, honest bounds in
-the package comment. Comments explain a constraint, not the commit.
+Printf wrappers whose format string is a parameter, state actual bounds
+plainly in the package comment. Comments explain a constraint, not the
+commit.

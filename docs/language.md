@@ -146,7 +146,8 @@ wasigoc examples/modnest/main.go -o modnest.cpp --out-dir gen/
 - `fmt.Printf` format must be a string literal at the call site — no
   `log.Printf`-shaped wrappers.
 - `uintptr` is `uint64` (same width as `uint`).
-- `//go:embed` is not generated (`embed.FS` is an honest stub).
+- `//go:embed` is not generated (`embed.FS` returns a clear
+  "not supported" error rather than faking a read).
 - Range-over-func does not support `return` from inside the loop body
   (break/continue are fine).
 - Generic interfaces (`type I[T any] interface`) are not generated.
