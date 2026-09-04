@@ -46,10 +46,11 @@ type Cmd struct {
 	Stderr io.Writer
 	Stdin  io.Reader
 
-	started   bool
-	handle    string
-	pumpDone  chan bool
-	stdinDone chan bool
+	started    bool
+	handle     string
+	stdoutDone chan bool
+	stderrDone chan bool
+	stdinDone  chan bool
 }
 
 func Command(name string, arg ...string) *Cmd {
@@ -68,22 +69,6 @@ func (c *Cmd) argv() string {
 		s = s + a
 	}
 	return s
-}
-
-// exit=<n>\n<output> -- real_win.cc::Exec's reply shape.
-func parseExecReply(reply string) (int, string) {
-	if !strings.HasPrefix(reply, "exit=") {
-		return -1, reply
-	}
-	i := strings.Index(reply, "\n")
-	if i < 0 {
-		return -1, reply[5:]
-	}
-	n, err := strconv.Atoi(reply[5:i])
-	if err != nil {
-		return -1, reply[i+1:]
-	}
-	return n, reply[i+1:]
 }
 
 // "exit=<n>" -- real_win.cc::ExecWait's reply shape (no trailing output).
@@ -108,37 +93,6 @@ func parseStartHandle(reply string) string {
 	return reply[i+len(p):]
 }
 
-// CombinedOutput runs the command for real when a gocvm host bridge is
-// registered. The real backend redirects stdout+stderr to the same pipe
-// (see shim_sandbox's docs/architecture.md), so unlike real Go's
-// os/exec, Output() below can't isolate stdout alone -- it returns the
-// same combined bytes CombinedOutput() does.
-//
-// When c.Stdin is set, the one-shot "os.exec" topic can't stream input
-// during its single blocking call, so this routes through Start+Wait
-// instead (the same path that already streams Stdin for c.Start()),
-// capturing output into a local buffer.
-func (c *Cmd) CombinedOutput() ([]byte, error) {
-	if c.Stdin != nil {
-		return c.combinedOutputWithStdin()
-	}
-	reply, err := gocvm.Call("os.exec", c.argv())
-	if err != nil {
-		if isNoBridge(err) {
-			return nil, errNotSupported
-		}
-		return nil, err
-	}
-	if isRealError(reply) {
-		return nil, errors.New(reply)
-	}
-	code, out := parseExecReply(reply)
-	if code != 0 {
-		return []byte(out), errors.New("exit status " + strconv.Itoa(code))
-	}
-	return []byte(out), nil
-}
-
 type sliceWriter struct {
 	buf *[]byte
 }
@@ -148,40 +102,44 @@ func (w *sliceWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *Cmd) combinedOutputWithStdin() ([]byte, error) {
-	var out []byte
-	savedStdout, savedStderr := c.Stdout, c.Stderr
-	c.Stdout = &sliceWriter{&out}
-	c.Stderr = nil
+// Run/Output/CombinedOutput all route through Start+Wait, which gives
+// stdout and stderr independent real pipes (unlike the older one-shot
+// "os.exec" topic, still valid for direct gocvm.Call use but unused by
+// this package now) -- Output can therefore actually isolate stdout the
+// way real Go's does, and CombinedOutput's two pumps sharing one buffer
+// gets the same non-deterministic interleaving real Go's own
+// CombinedOutput has (it also copies two separate pipes concurrently).
+func (c *Cmd) Run() error {
 	if err := c.Start(); err != nil {
-		c.Stdout, c.Stderr = savedStdout, savedStderr
-		return nil, err
+		return err
 	}
-	err := c.Wait()
-	c.Stdout, c.Stderr = savedStdout, savedStderr
-	return out, err
+	return c.Wait()
 }
 
 func (c *Cmd) Output() ([]byte, error) {
-	return c.CombinedOutput()
+	var out []byte
+	c.Stdout = &sliceWriter{&out}
+	err := c.Run()
+	return out, err
 }
 
-func (c *Cmd) Run() error {
-	_, err := c.CombinedOutput()
-	return err
+func (c *Cmd) CombinedOutput() ([]byte, error) {
+	var out []byte
+	w := &sliceWriter{&out}
+	c.Stdout = w
+	c.Stderr = w
+	err := c.Run()
+	return out, err
 }
 
-// pump drains the child's combined stdout+stderr into whichever of
-// Stdout/Stderr is set (Stdout preferred -- the real backend can't
-// separate the two streams, see the package doc above) until EOF, then
-// signals pumpDone so Wait knows output has been fully flushed.
-func (c *Cmd) pump() {
-	w := c.Stdout
-	if w == nil {
-		w = c.Stderr
-	}
+// pumpStream drains one of the child's real output pipes into w (a
+// no-op sink, not a skipped goroutine, when w is nil -- Start always
+// runs both stdout and stderr pumps so neither pipe can fill up and
+// block the child just because the caller didn't ask for that stream)
+// until EOF, then signals done.
+func (c *Cmd) pumpStream(topic string, w io.Writer, done chan bool) {
 	for {
-		reply, err := gocvm.Call("os.exec.stdout.read", c.handle+"\x1f"+"4096")
+		reply, err := gocvm.Call(topic, c.handle+"\x1f"+"4096")
 		if err != nil || isRealError(reply) || reply == "" {
 			break
 		}
@@ -189,15 +147,12 @@ func (c *Cmd) pump() {
 			w.Write([]byte(reply))
 		}
 	}
-	c.pumpDone <- true
+	done <- true
 }
 
-// writeStdin drains c.Stdin into the child's real stdin pipe (an
-// os.exec.start handle's stdin pipe -- see shim_sandbox's real_win.cc,
-// which wires stdin to NUL only for the one-shot Exec topic used by
-// CombinedOutput's no-Stdin path) until EOF, then closes the pipe so the
-// child sees its own EOF, matching real Go's Cmd.Wait semantics of
-// closing Stdin after copying finishes.
+// writeStdin drains c.Stdin into the child's real stdin pipe until EOF,
+// then closes the pipe so the child sees its own EOF, matching real
+// Go's Cmd.Wait semantics of closing Stdin after copying finishes.
 func (c *Cmd) writeStdin() {
 	buf := make([]byte, 4096)
 	for {
@@ -217,12 +172,13 @@ func (c *Cmd) writeStdin() {
 }
 
 // Start launches the command for real (goclang++.bat --shim-sandbox)
-// without waiting for it to exit. If Stdout or Stderr is set, a
-// background goroutine streams the child's combined output into it as
-// it arrives; if Stdin is set, a background goroutine streams it into
-// the child's real stdin pipe. Wait below joins both goroutines before
-// returning so all I/O is flushed first, matching real Go's Cmd.Wait
-// semantics.
+// without waiting for it to exit. Stdout and stderr each get their own
+// real pipe and their own pump goroutine, always -- not just when the
+// caller set that field -- since an undrained pipe can block the child
+// once its buffer fills. If Stdin is set, a background goroutine streams
+// it into the child's real stdin pipe. Wait below joins all goroutines
+// before returning so all I/O is flushed first, matching real Go's
+// Cmd.Wait semantics.
 func (c *Cmd) Start() error {
 	reply, err := gocvm.Call("os.exec.start", c.argv())
 	if err != nil {
@@ -240,10 +196,10 @@ func (c *Cmd) Start() error {
 	}
 	c.handle = h
 	c.started = true
-	if c.Stdout != nil || c.Stderr != nil {
-		c.pumpDone = make(chan bool, 1)
-		go c.pump()
-	}
+	c.stdoutDone = make(chan bool, 1)
+	go c.pumpStream("os.exec.stdout.read", c.Stdout, c.stdoutDone)
+	c.stderrDone = make(chan bool, 1)
+	go c.pumpStream("os.exec.stderr.read", c.Stderr, c.stderrDone)
 	if c.Stdin != nil {
 		c.stdinDone = make(chan bool, 1)
 		go c.writeStdin()
@@ -255,9 +211,8 @@ func (c *Cmd) Wait() error {
 	if !c.started {
 		return errNotSupported
 	}
-	if c.pumpDone != nil {
-		<-c.pumpDone
-	}
+	<-c.stdoutDone
+	<-c.stderrDone
 	if c.stdinDone != nil {
 		<-c.stdinDone
 	}
@@ -279,5 +234,19 @@ func (c *Cmd) Wait() error {
 }
 
 func LookPath(file string) (string, error) {
-	return "", errNotSupported
+	reply, err := gocvm.Call("os.exec.lookpath", file)
+	if err != nil {
+		if isNoBridge(err) {
+			return "", errNotSupported
+		}
+		return "", err
+	}
+	if isRealError(reply) {
+		return "", ErrNotFound
+	}
+	const p = "ok "
+	if !strings.HasPrefix(reply, p) {
+		return "", errors.New("exec: malformed lookpath reply")
+	}
+	return reply[len(p):], nil
 }

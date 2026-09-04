@@ -2066,6 +2066,76 @@ byte-for-byte round trip, zero hang, process list clean afterward.
 `shim_sandbox` `ctest`: 2/2, unchanged after adding the mutex/pool --
 no regression from the new real locking.
 
+**Same day, closing the other os/exec gap -- stdout and stderr now on
+genuinely separate pipes, which also fixed a real correctness bug in
+`Output()`.** The one-shot `os.exec` topic and `os.exec.start` both
+combined stdout+stderr into one pipe since the very first GocVM round,
+which meant `Cmd.Output()` -- supposed to return stdout only, per real
+Go -- was silently returning combined output instead, same as
+`CombinedOutput()`. Added `LaunchProcessSplit` in `real_win.cc` (three
+independent real pipes: stdout, stderr, stdin, vs. the older
+`LaunchProcess`'s one combined pipe + NUL stdin, which `Exec`/`os.exec`
+still uses unchanged) and a new `os.exec.stderr.read` topic
+(`ExecStderrRead`, refactored alongside `ExecStdoutRead` into a shared
+`ExecStreamRead(handle_and_maxlen, HANDLE ProcEntry::*stream)` taking a
+member pointer so the two differ only in which `ProcEntry` field they
+read). `ProcEntry` gained `stderr_read`, closed by `Release` alongside
+the existing fields.
+
+On the Go side, `pump()` (one goroutine, whichever of Stdout/Stderr was
+set) became `pumpStream(topic, w, done)` (one per stream, always both,
+`w` a discard sink when nil) -- "always both, even when the caller set
+neither" is deliberate, not just simpler: an output pipe nobody drains
+fills its buffer and blocks the child once it's full, a real latent hang
+this package had before today for a plain `Run()` with no output
+captured, on any sufficiently chatty command. `Run`/`Output`/
+`CombinedOutput` were rewritten to all route through `Start`+`Wait`
+uniformly (dropping the branch added earlier today for Stdin, which
+this generalizes): `Output` sets only `Stdout` to a capture buffer,
+`CombinedOutput` sets `Stdout` and `Stderr` to the SAME buffer -- the two
+pump goroutines interleave into it in whatever order the scheduler
+happens to resume them, the exact same non-deterministic-interleaving
+caveat real Go's own `CombinedOutput` has (it doesn't OS-combine the fds
+either; it copies two separate pipes into one writer concurrently). The
+older one-shot `os.exec` topic/`Exec()` C++ function is untouched and
+still works -- just no longer called from this package's Go source,
+kept as a valid direct-`gocvm.Call` primitive rather than deleted.
+
+Verified with four real compiled-and-run checks, not just golden-test
+byte comparison: (1) `Output()` on a child writing one line to stdout and
+one to stderr returns ONLY the stdout line -- the actual bug being fixed;
+(2) `CombinedOutput()` on the same child contains both lines; (3) a
+10,000-byte `Stdin` write concurrent with separate `Stdout`/`Stderr`
+capture on `findstr.exe`, confirming independent-pipe reads plus a
+concurrent write all still interleave correctly under the worker pool
+from the fix above; (4) `Run()` on a 500-line-chatty `cmd.exe` child with
+NEITHER `Stdout` nor `Stderr` set -- the specific case that would have
+hung under the old conditional-pump code, completes cleanly.
+
+**Same day, last `os/exec` gap -- `LookPath` is real.** Added
+`os.exec.lookpath` (`ExecLookPath` in `real_win.cc`): real `%PATH%`/
+`%PATHEXT%` search via `GetEnvironmentVariableW`+`GetFileAttributesW`,
+current directory NOT implicitly searched (matches modern Go's own
+hardened `LookPath`, which deliberately doesn't fall back to classic
+cmd.exe's implicit-cwd behavior for security reasons -- same choice,
+not an oversight). A name with an extension already (a `.` in its final
+path element, `HasExtension`) is checked as an exact match; one without
+tries each `%PATHEXT%` entry in order (default `.COM;.EXE;.BAT;.CMD` if
+unset, same default real Go uses). Bounded relative to real Go's actual
+algorithm: no `ErrDot` relative-path diagnostic, no UNC-path
+special-casing. Go's `exec.LookPath` reuses the package's existing
+`ErrNotFound` on a miss. Verified against real files on this machine:
+`LookPath("cmd")` resolves via the `.EXE` `PATHEXT` entry to
+`C:\WINDOWS\system32\cmd.EXE`, `LookPath("cmd.exe")` resolves the same
+target via the exact-match path (extension already present, no PATHEXT
+loop), and a nonsense name correctly returns `ErrNotFound`.
+
+Full `ctest`, both repos: 283/283 (WASIGo++) + 2/2 (shim_sandbox) for
+the stdout/stderr split and the `LookPath` addition; `LookPath` itself
+verified by hand outside the golden harness (`os/exec`'s golden tests all
+run bridge-less, same as every gocvm-backed package, so PATH search has
+no bridge-less path to cover in `ctest` at all).
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not
@@ -2190,7 +2260,7 @@ map (no dynamic load, no cgo, no race detector, no host syslog).
 | `net/textproto` | **in** (partial -- pure string/header handling, no `Conn`/`Pipeline`: `CanonicalMIMEHeaderKey`, `MIMEHeader` + free `Header{Get,Set,Add,Del,Values}` functions since methods need a struct receiver, `Reader.ReadLine`/`ReadMIMEHeader` with continuation-line folding) |
 | `net/url` | **in** (`QueryEscape`/`QueryUnescape`/`PathEscape`/`PathUnescape`, `URL` struct + `Parse`/`String`, `ParseQuery` -- no userinfo/port split, `ParseQuery` returns a flat `map[string]string` not real Go's multi-value `Values`) |
 | `os` | **in** (builtin: Args/Exit/Getenv/File/Stdout/Stdin/Stderr, `Stat`/`FileInfo`, `ReadDir`/`DirEntry` -- real directory listing via `<dirent.h>` opendir/readdir/closedir, genuine WASI `fd_readdir`, not a stub) + **rt** (Setenv/process still todo) |
-| `os/exec` | **in** (`Run`/`Output`/`CombinedOutput`/`Start`/`Wait` are all real via `gocvm.Call("os.exec"/"os.exec.start"/"wait"/"stdout.read"/"stdin.write"/"stdin.close", ...)` on a `goclang++.bat --shim-sandbox` build (real `CreateProcess`; `Start`+`Wait` stream real output into `Cmd.Stdout`/`Stderr` via a pump goroutine and real input out of `Cmd.Stdin` via a second, concurrent goroutine, see the GocVM diary entry above -- `CombinedOutput`/`Run`/`Output` route through `Start`+`Wait` instead of the one-shot `os.exec` topic whenever `Cmd.Stdin` is set, since that topic can't stream input during its single blocking call); plain wasm32-wasip1 still has no subprocess support, so those fall back to the same clear "not supported" error as before. `LookPath` stays stubbed -- no PATH-search topic exists yet; stdout/stderr still can't be separated (the real backend combines them into one pipe) |
+| `os/exec` | **in** (`Run`/`Output`/`CombinedOutput`/`Start`/`Wait` are all real via `gocvm.Call("os.exec.start"/"wait"/"stdout.read"/"stderr.read"/"stdin.write"/"stdin.close", ...)` on a `goclang++.bat --shim-sandbox` build (real `CreateProcess`; `Start` gives stdout, stderr, and stdin each their own real pipe -- `Output` genuinely isolates stdout the way real Go's does, `CombinedOutput` shares one buffer between both pump goroutines, same non-deterministic interleaving real Go's own `CombinedOutput` has; both output pumps always run, even when the caller left `Stdout`/`Stderr` nil, so a chatty child with nobody draining its pipes can't block -- see the GocVM diary entry above); plain wasm32-wasip1 still has no subprocess support, so those fall back to the same clear "not supported" error as before. `LookPath` is real too, via `gocvm.Call("os.exec.lookpath", ...)`: real `%PATH%`/`%PATHEXT%` search (`GetEnvironmentVariableW`+`GetFileAttributesW`), current directory NOT implicitly searched (matches modern Go's own hardened behavior, not classic cmd.exe) -- bounded relative to real Go's actual algorithm: no `ErrDot` diagnostic, no UNC-path special-casing. The older one-shot `os.exec` topic (combined pipe, stdin NUL) still exists in shim_sandbox and works, but `Run`/`Output`/`CombinedOutput` no longer call it -- it's a valid primitive for direct `gocvm.Call` use, not dead code, just unused by this package now) |
 | `os/user` | **in** (`Current`/`Lookup`/`LookupId` are all real via `gocvm.Call("os.user", ...)` on a `goclang++.bat --shim-sandbox` build (real `GetUserNameW`/`LookupAccountNameW`/`LookupAccountSidW`+`NetUserGetInfo`, see the GocVM diary entry above); plain wasm32-wasip1 falls back to the same "not supported" error as before) |
 | `os/signal` | **in** (deliberate no-op, same honest-boundary shape as `os/exec`/`runtime` -- WASI preview1 delivers no signals to a wasm guest at all. `Notify`/`Stop`/`Ignore`/`Reset`; signals are a plain `int` (POSIX-numbered), not real Go's `os.Signal` interface, since `os` is a compiler builtin here. Found and fixed one more general compiler bug building this: `package signal` collided with the C standard library's global `signal()` -- same class of fix already applied to `log`/`rand`, extended to cover this name too) |
 | `path` | **in** (partial) |
