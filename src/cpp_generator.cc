@@ -545,6 +545,13 @@ class Generator {
   bool program_has_go_ = false;
   bool current_async_ = false;
   bool current_has_defers_ = false;
+  // Set by EmitDefer when at least one of the current function's defers
+  // is itself async (its own body uses channels) -- see EmitDefer's own
+  // comment. Every exit point then needs `co_await
+  // __defers.RunAllAwait()` instead of the synchronous RunAll()/
+  // destructor path, since only the enclosing coroutine's own generated
+  // code can co_await anything.
+  bool current_has_async_defers_ = false;
   struct JumpFrame {
     std::string name;
     std::string brk;
@@ -3492,7 +3499,7 @@ class Generator {
         out_ << Indent() << EmitExpr(*s.lhs[0]) << s.op << ";\n";
         return;
       case StmtKind::ExprStmt:
-        if (current_has_defers_ && !current_async_ && s.lhs[0] &&
+        if (current_has_defers_ && s.lhs[0] &&
             s.lhs[0]->kind == ExprKind::Call && s.lhs[0]->callee &&
             s.lhs[0]->callee->kind == ExprKind::Ident && s.lhs[0]->callee->strval == "panic" &&
             s.lhs[0]->args.size() == 1) {
@@ -3640,6 +3647,22 @@ class Generator {
     // Go evaluates the function and arguments now; the call runs later.
     if (e.kind != ExprKind::Call) {
       out_ << Indent() << "__defers.push([=]{ " << EmitExpr(e) << "; });\n";
+      return;
+    }
+    // `defer func(){ <uses channels> }()`: the literal's own body is a
+    // Task-returning coroutine, so calling it and discarding the result
+    // (what the plain `push([&]{ EmitExpr(e); })` path below does) would
+    // abandon it suspended at its first co_await, same hazard as go()-ing
+    // a bare async literal (see GoAsyncLit's own comment). push_async +
+    // AsyncImpl::run_await() calls it and properly co_awaits it instead
+    // -- see DeferList's own comment in runtime.hpp. Ordinary func
+    // literals already capture `[&]` (EmitExpr's normal rule, unlike
+    // go's by-value capture), matching exactly what defer needs (see the
+    // literal_call `[&]` reasoning below), so the literal alone --
+    // uninvoked, EmitExpr(*e.callee) -- is exactly what push_async wants.
+    if (e.callee && e.callee->func_lit && StmtsNeedAwait(e.callee->func_lit->body)) {
+      current_has_async_defers_ = true;
+      out_ << Indent() << "__defers.push_async(" << EmitExpr(*e.callee) << ");\n";
       return;
     }
     std::vector<std::string> at;
@@ -4395,6 +4418,40 @@ class Generator {
     out_ << Indent() << "return false;\n";
   }
 
+  // A named result a defer might modify (e.g. via recover(), or just
+  // appending to it) needs the defer to run BEFORE the return statement
+  // reads it -- see DeferList::RunAll's own comment for why relying on
+  // ~DeferList() alone (the plain, no-defers-to-worry-about case) reads
+  // the named result's PRE-defer value. `values` is empty for a bare
+  // `return` (the named results already hold whatever they hold, no
+  // assignment needed); otherwise one value per named result, assigned
+  // in first -- matching real Go, where a defer can still change what an
+  // explicit `return expr` returns, via the named result.
+  void EmitReturnWithDefers(const char* kw, const std::vector<std::string>& values) {
+    const auto& names = current_func_->result_names;
+    for (size_t i = 0; i < names.size() && i < values.size(); ++i) {
+      const std::string& nm = names[i];
+      if (nm.empty() || nm == "_") continue;
+      out_ << Indent() << CppIdent(nm) << " = " << values[i] << ";\n";
+    }
+    if (current_async_ && current_has_async_defers_) {
+      out_ << Indent() << "co_await __defers.RunAllAwait();\n";
+    } else {
+      out_ << Indent() << "__defers.RunAll();\n";
+    }
+    if (names.size() == 1) {
+      out_ << Indent() << kw << " " << CppIdent(names[0]) << ";\n";
+    } else {
+      out_ << Indent() << kw << " {";
+      for (size_t i = 0; i < names.size(); ++i) {
+        if (i) out_ << ", ";
+        const std::string& nm = names[i];
+        out_ << (nm.empty() || nm == "_" ? "{}" : CppIdent(nm));
+      }
+      out_ << "};\n";
+    }
+  }
+
   void EmitReturn(const Stmt& s) {
     for (auto it = jump_stack_.rbegin(); it != jump_stack_.rend(); ++it) {
       if (it->range_func) {
@@ -4407,7 +4464,9 @@ class Generator {
       if (IsMainFunc() && !current_async_) {
         out_ << Indent() << "return 0;\n";
       } else if (!in_func_lit_ && HasNamedResults(current_func_)) {
-        if (current_func_->results.size() == 1) {
+        if (current_has_defers_) {
+          EmitReturnWithDefers(kw, {});
+        } else if (current_func_->results.size() == 1) {
           out_ << Indent() << kw << " " << CppIdent(current_func_->result_names[0]) << ";\n";
         } else {
           out_ << Indent() << kw << " {";
@@ -4447,14 +4506,29 @@ class Generator {
         return;
       }
       const TypeNode* rt = CurrentResultCount() == 1 ? CurrentResultType(0) : nullptr;
-      out_ << Indent() << kw << " " << EmitExprAs(*s.rhs[0], rt) << ";\n";
+      std::string val = EmitExprAs(*s.rhs[0], rt);
+      if (!in_func_lit_ && current_has_defers_ && HasNamedResults(current_func_) &&
+          current_func_->results.size() == 1) {
+        EmitReturnWithDefers(kw, {val});
+      } else {
+        out_ << Indent() << kw << " " << val << ";\n";
+      }
+      return;
+    }
+    std::vector<std::string> vals;
+    for (size_t i = 0; i < s.rhs.size(); ++i) {
+      const TypeNode* rt = i < CurrentResultCount() ? CurrentResultType(i) : nullptr;
+      vals.push_back(EmitExprAs(*s.rhs[i], rt));
+    }
+    if (!in_func_lit_ && current_has_defers_ && HasNamedResults(current_func_) &&
+        current_func_->results.size() == s.rhs.size()) {
+      EmitReturnWithDefers(kw, vals);
       return;
     }
     out_ << Indent() << kw << " {";
-    for (size_t i = 0; i < s.rhs.size(); ++i) {
+    for (size_t i = 0; i < vals.size(); ++i) {
       if (i) out_ << ", ";
-      const TypeNode* rt = i < CurrentResultCount() ? CurrentResultType(i) : nullptr;
-      out_ << EmitExprAs(*s.rhs[i], rt);
+      out_ << vals[i];
     }
     out_ << "};\n";
   }
@@ -5007,28 +5081,100 @@ class Generator {
   void EmitWrappedBody(const std::vector<std::unique_ptr<Stmt>>& body, bool async, bool is_main) {
     bool wrap = StmtsHaveDefer(body);
     current_has_defers_ = wrap;
-    // setjmp cannot land in a C++20 coroutine frame (the WASM mapping for
-    // panic/recover). Defer still runs on the normal co_return path.
+    current_has_async_defers_ = false;
+    // A direct `panic("literal")` call site inside a function with defer
+    // compiles to `__pf.has_pending = true; goto __wasigo_end;` (see
+    // EmitStmt's ExprStmt case) rather than a call to the runtime
+    // wasigo::panic() (which unconditionally aborts outside a gocvm
+    // bridge) -- this used to be gated to non-async functions only
+    // ("setjmp cannot land in a C++20 coroutine frame"), but the actual
+    // mechanism is a plain structured `goto` to a same-function label,
+    // not setjmp/longjmp, and that's just as valid inside a coroutine
+    // body as outside one -- the goto only ever jumps forward, over
+    // code, never into a suspended scope. What DID need fixing first
+    // (see runtime.hpp's current_panic_head()/current_vthread()) was
+    // thread-safety: a coroutine can suspend mid-function with __pf
+    // still live, uncleared, so two goroutines' own PanicFrame chains
+    // must not share the flat per-OS-thread chain wasigo::panic()'s
+    // caller-less "just abort" path never had to worry about.
     if (is_main) EmitStartupInits();
     EmitNamedResultDecls();
     if (wrap) {
-      if (!async) out_ << Indent() << "wasigo::PanicFrame __pf;\n";
+      out_ << Indent() << "wasigo::PanicFrame __pf;\n";
       out_ << Indent() << "wasigo::DeferList __defers;\n";
     }
     for (auto& st : body) EmitStmt(*st);
-    if (wrap && !async) out_ << Indent() << "__wasigo_end: ;\n";
+    if (wrap) out_ << Indent() << "__wasigo_end: ;\n";
     if (async) {
       bool last_returns = !body.empty() && body.back() && body.back()->kind == StmtKind::Return;
-      if (!last_returns) {
-        if (current_func_ && !current_func_->results.empty()) {
-          out_ << Indent() << "co_return {};\n";
+      // A panic before the body's own final `return` jumps straight to
+      // __wasigo_end via goto, skipping that return's own co_return
+      // entirely -- so `wrap` (has defer, meaning that goto exists at
+      // all) needs this fallback even when last_returns is true. In the
+      // ordinary non-panicking path this is simply unreachable code
+      // after the real return's own co_return, same as the sync case's
+      // identical `__wasigo_end: ;` label sitting after a real `return`.
+      // Named results need the SAME treatment EmitReturn's own bare-
+      // `return` case gives them via EmitReturnWithDefers (a defer can
+      // have just set one, e.g. recover()'s result, and RunAll() must
+      // run before it's read) -- co_return {} would silently discard it.
+      if (!last_returns || wrap) {
+        if (!in_func_lit_ && HasNamedResults(current_func_) && wrap) {
+          // wrap, not just current_has_defers_: EmitReturnWithDefers
+          // references __defers, which is only ever declared when wrap
+          // is true (see just above) -- reachable here with wrap false
+          // is the plain "async function, no defers, body doesn't end
+          // in return" case, unrelated to any of this.
+          EmitReturnWithDefers("co_return", {});
+        } else if (!in_func_lit_ && HasNamedResults(current_func_)) {
+          if (current_func_->results.size() == 1) {
+            out_ << Indent() << "co_return " << CppIdent(current_func_->result_names[0]) << ";\n";
+          } else {
+            out_ << Indent() << "co_return {";
+            for (size_t i = 0; i < current_func_->result_names.size(); ++i) {
+              if (i) out_ << ", ";
+              const std::string& nm = current_func_->result_names[i];
+              out_ << (nm.empty() || nm == "_" ? "{}" : CppIdent(nm));
+            }
+            out_ << "};\n";
+          }
         } else {
-          out_ << Indent() << "co_return;\n";
+          // No named result to protect, but an async defer still needs
+          // to actually run (for its side effects) via co_await, not the
+          // synchronous RunAll()/destructor path it can't reach through.
+          if (wrap && current_has_async_defers_) {
+            out_ << Indent() << "co_await __defers.RunAllAwait();\n";
+          }
+          if (current_func_ && !current_func_->results.empty()) {
+            out_ << Indent() << "co_return {};\n";
+          } else {
+            out_ << Indent() << "co_return;\n";
+          }
         }
       }
     } else if (is_main) {
       if (program_has_go_) out_ << Indent() << "wasigo::run();\n";
       out_ << Indent() << "return 0;\n";
+    } else if (wrap && current_func_ && !current_func_->results.empty()) {
+      // Same reasoning as the async branch above, for a plain (non-async,
+      // non-main) function: without `wrap`, a trailing panic() call still
+      // compiles to the real [[noreturn]] wasigo::panic() (see EmitStmt's
+      // ExprStmt case), so the compiler already knows nothing follows it
+      // and needs no fallback here. With `wrap`, that same panic call
+      // instead becomes `goto __wasigo_end`, a plain (returning) label --
+      // real Go treats a function ending in panic() as terminating with
+      // no explicit trailing return needed (panic is itself a Go spec
+      // "terminating statement"), a genuinely common idiom paired with a
+      // defer that sets a named result via recover(); losing
+      // [[noreturn]]'s "unreachable after this" guarantee here needs the
+      // same fallback the async branch above already gets.
+      if (!in_func_lit_ && HasNamedResults(current_func_)) {
+        // wrap is true in this whole branch (the enclosing else-if
+        // requires it), so __defers is guaranteed declared.
+        EmitReturnWithDefers("return", {});
+      } else {
+        out_ << Indent() << "return {};\n";
+      }
     }
   }
 

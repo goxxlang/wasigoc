@@ -1892,6 +1892,116 @@ intermediate state was caught by manual testing, never by `ctest` --
 existing goldens don't happen to exercise this exact spread shape,
 worth remembering if this code is touched again).
 
+**Same day, last round -- panic/recover actually works in async
+functions now, four real bugs deep, plus a severe regression found and
+fixed before it ever got committed.** Started from a specific, correct
+observation: `recover()`'s pending-panic chain (`g_panic_frame`, a flat
+`thread_local`) is exactly the kind of state the VThread/goroutine
+thread-safety work earlier this session was about, and it had never
+actually been made safe. Two real goroutines each holding a live,
+un-popped `PanicFrame` (possible any time a function with `defer`
+suspends mid-body -- a channel op, an async gocvm call) could scramble
+each other's `prev` links across a scheduler switch, or hand `recover()`
+one goroutine's pending panic while running as a completely different
+one.
+
+Fixed for real: each `gocvm::VThread` now owns its own `panic_head`
+chain instead of sharing one flat per-OS-thread chain.
+`gocvm::current_vthread()` (Meyer's-singleton `thread_local`, from the
+start this time -- see `g_error_state`'s own linker-bug history) tracks
+whichever goroutine is actually executing, saved/restored around every
+`Scheduler::run()` resume and captured at every point a goroutine parks
+itself (`Chan`'s three awaiters, `CallAsyncAwaiter`, `Task`/`TaskT`'s own
+`await_suspend`) so the right chain gets restored on resume regardless
+of what ran in between. `PanicFrame`'s ctor/dtor and `recover()` route
+through `current_panic_head()` (the current VThread's own chain, or the
+old flat chain as a fallback for code that isn't running as any spawned
+goroutine -- `main()` itself, in particular).
+
+Checking whether this bug was even reachable surfaced the real, bigger
+gap: `panic("literal")` inside a function with `defer` only ever got the
+`__pf.has_pending = true; goto __wasigo_end` treatment (letting a
+deferred `recover()` catch it) when the function was **not** async --
+gated that way since the mechanism was originally setjmp-based, and
+"setjmp cannot land in a C++20 coroutine frame." The actual mechanism
+today is a plain structured `goto`, not setjmp, and a goto within one
+function is exactly as valid inside a coroutine body as outside one --
+so panic/recover inside a goroutine's own body had simply never worked
+at all, independent of any threading concern, since only a non-async
+function could ever hold a `PanicFrame`. Opened the gate.
+
+Doing that surfaced two more real, previously-unreachable bugs (unreachable
+because nothing could get a `PanicFrame` in an async function before):
+a `goto` firing before a function's own trailing `return` skips that
+return's `co_return`/`return` entirely, and if the function's *textual*
+last statement WAS a return (a common shape: a function ending in
+`panic(...)` needs no explicit trailing return in real Go, since `panic`
+is itself a spec "terminating statement"), nothing else supplied a
+fallback -- for a `TaskT<T>` coroutine (no `return_void()`), that's a
+hard "fell off the end of a non-void coroutine" compile error; for a
+plain sync function, it was a real (if less loud) "no return statement"
+UB gap that happened to work by luck before now, via whatever the
+optimizer's NRVO did or didn't do. Fixed both (async and sync) with an
+explicit fallback after `__wasigo_end:`, always present whenever `wrap`
+(has defer) is true regardless of whether the last statement looks like
+a return, since a panic earlier in the body can bypass it either way.
+
+That, in turn, surfaced a THIRD, more fundamental bug, present even with
+no panic involved at all: a named result a `defer` modifies (the
+standard `func f() (result T) { defer func(){ recover(); result = ... }
+() ; ... }` idiom -- or just as often a defer plainly appending to a
+result) silently discarded the defer's change in an async function.
+`co_return result` copies `result`'s value into the promise via
+`return_value(T)` **before** any local's destructor runs (`return`/
+`co_return` are specified that way) -- `~DeferList()`'s own defer-running
+happens strictly after, too late. The sync case happened to still work,
+but only because NRVO (not guaranteed by the standard) makes `result`
+and the actual return slot the same storage the whole time -- fragile,
+not actually correct. Fixed generally: `DeferList::RunAll()`/new
+`RunAllAwait()` are called EXPLICITLY, before the named result is read,
+at every return site with named results (`EmitReturnWithDefers` in
+cpp_generator.cc) -- for a non-bare `return expr`, that means assigning
+into the named result first, THEN running defers, THEN returning it,
+matching real Go's actual defer/named-result order for both bare and
+explicit-value returns, sync and async alike.
+
+A FOURTH bug, also panic-independent: `defer func(){ <-ch }()` --a
+deferred closure whose own body uses channels -- silently never ran its
+body at all. Same root cause class as this session's earlier `go
+func(){...}()` dangling-closure bug: the closure is itself a
+Task-returning coroutine, always suspended at `initial_suspend()` until
+something resumes it, and the old codegen just called it and discarded
+the result (`~DeferList()`'s plain `n->run()`), abandoning it suspended
+forever. Fixed with `DeferList::AsyncImpl`/`push_async` (mirrors
+`Impl`/`push` but the closure is `co_await`ed, not called-and-dropped)
+and two driving paths: an ASYNC enclosing function `co_await`s
+`__defers.RunAllAwait()` directly (added at every exit point that
+previously relied on the destructor); a SYNC enclosing function (which
+cannot `co_await` at all -- Go allows deferring an async closure from a
+plain function with no channels of its own) spawns the closure as a real
+goroutine and drives just that one to completion via a new
+`wasigo::RunUntil(bool* done)`, which pumps the scheduler's own
+resume/vthread-restore loop but stops as soon as that one flag flips --
+deliberately NOT `wasigo::run()`, which drains every pending goroutine
+in the whole program, not just this defer's.
+
+**Before any of this landed, a severe regression in the fix itself, found by full-suite testing, not review.** `DeferList`'s full definition had been moved to right after `struct Task` (needed complete for the async pieces) -- which put its ENTIRELY UNRELATED synchronous core (`Node`/`Impl`/`push`/`RunAll`/`~DeferList()`, no `Task` involved at all) inside the pre-existing `#ifdef WASIGO_NEED_CORO` block, a real, load-bearing optimization gate: wasigoc only compiles Task/Chan/Scheduler in for a program whose transitive source actually uses channels/goroutines somewhere, and plain `defer` has always been completely independent of that. Broke `database/sql` first (`sql.go` uses ordinary `defer`, no channels anywhere in the whole `sqlpkg` example's transitive closure) with a baffling "aggregate has incomplete type" error deep inside a generated header, despite `DeferList` being textually complete earlier in the very same translation unit. Root-caused via bisection: an isolated `runtime.hpp` + the failing header compiled FINE on its own; only the full ~3400-line prefix reproduced it; `-E` preprocessor output confirmed the ENTIRE coroutine section -- Task, TaskT, Scheduler, DeferList, all of it -- was silently absent whenever the compiling package didn't need `WASIGO_NEED_CORO` itself. Fixed by splitting `DeferList` back apart: `Node`/`Impl`/`push`/`RunAll`/`~DeferList()` (needs nothing from Task) stayed at DeferList's ORIGINAL early location, unconditionally compiled; `run_await()` (the one non-template virtual with a body, needed on `Node` so `RunAllAwait()` can call it polymorphically regardless of whether a given defer is sync or async) is declared there but its body defined out-of-line, later, once Task is real -- same declare-early/define-late split this session already used for `PanicFrame`'s ctor/dtor; `AsyncImpl`/`push_async`/`RunAllAwait()` (needs Task by name in their own signatures) are wrapped in their own `#ifdef WASIGO_NEED_CORO` inside the early class body, matching the exact condition under which Task exists at all -- always true wherever an async defer could exist in the first place, since the deferred closure's own channel use is what turns WASIGO_NEED_CORO on for that whole program.
+
+Verified with six real compiled-and-run Go++ programs, not just `ctest`
+(which never happened to exercise this shape before either): a single
+goroutine parking on a channel then panicking, caught by its own
+deferred `recover()`; the ORIGINAL two-goroutine scenario that started
+this whole investigation, each with its own defer/panic/recover,
+interleaved through the scheduler, confirming real isolation (`worker1
+recovered: boom from worker1` / `worker2 no panic`, never crossed); a
+named-result function ending in bare `panic()` (no trailing return) with
+a synchronous defer, both async and sync; a plain async function (no
+panic at all) whose defer appends to a named result; and a SYNC function
+deferring a channel-using closure with no async anything else involved.
+Full `ctest`, both repos: 283/283 -- including, after the regression fix,
+`database/sql` and every other plain-`defer`-no-channels package that
+briefly stopped linking.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not

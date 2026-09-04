@@ -331,22 +331,39 @@ struct PanicFrame {
   ~PanicFrame();
 };
 
-inline thread_local PanicFrame* g_panic_frame = nullptr;
-
-inline PanicFrame::PanicFrame() : prev(g_panic_frame) { g_panic_frame = this; }
-
-inline PanicFrame::~PanicFrame() {
-  g_panic_frame = prev;
-  if (has_pending && !recovered) {
-    // If a bridge is active, promote to ErrorState rather than aborting.
-    if (g_error_state().is_bridge()) {
-      g_error_state().bridge_panic(std::move(pending));
-      return;
-    }
-    std::cerr << "panic: " << pending << "\n";
-    std::abort();
-  }
+// Meyer's-singleton function wrapper, not a bare `inline thread_local`
+// variable -- see g_error_state's own history in this file (and the
+// design-log diary) for the real mingw/PE-COFF linker bug ("multiple
+// definition of TLS init function") a bare inline thread_local variable
+// hit here. This is the fallback chain for panic frames that aren't
+// running as part of any spawned goroutine (main() itself, or any
+// synchronous code before/outside a `go()`); a goroutine's own frames
+// chain onto its VThread instead -- see current_panic_head() below,
+// defined once gocvm::VThread is complete.
+inline PanicFrame*& g_panic_frame() {
+  thread_local PanicFrame* p = nullptr;
+  return p;
 }
+
+// A goroutine that suspends mid-function (a channel op, an async gocvm
+// call) can resume running interleaved with OTHER goroutines' own
+// PanicFrame push/pop pairs in between -- a single flat per-OS-thread
+// chain can't tell those apart (two concurrently-suspended goroutines
+// each holding a live, un-popped PanicFrame would corrupt each other's
+// `prev` links, and recover() could read a completely different
+// goroutine's pending panic). Routing through the CURRENT VThread's own
+// chain instead of a flat thread_local fixes this: each goroutine gets
+// an independent chain, unaffected by whichever other goroutine the
+// scheduler happens to run in between. Forward-declared here (VThread
+// isn't defined yet at this point in the file) and defined for real
+// right after VThread itself; PanicFrame's own ctor/dtor and recover()
+// are declared above/below but likewise DEFINED after that point, since
+// they need to call it.
+namespace gocvm {
+class VThread;
+VThread*& current_vthread();
+}  // namespace gocvm
+PanicFrame*& current_panic_head();
 
 // panic() — runtime faults (bounds, nil map, send on closed chan, etc.).
 // Stays [[noreturn]] for generated code: outside a bridge, aborts.
@@ -384,15 +401,8 @@ inline bool panic_or_stash(std::string m) {
 [[noreturn]] inline void panic(const char* m) { panic(std::string(m ? m : "")); }
 [[noreturn]] inline void panic(int64_t v) { panic(std::to_string(v)); }
 
-inline Recovered recover() {
-  if (!g_panic_frame || !g_panic_frame->has_pending) return {};
-  g_panic_frame->recovered = true;
-  Recovered r;
-  r.ok = true;
-  r.msg = std::move(g_panic_frame->pending);
-  g_panic_frame->has_pending = false;
-  return r;
-}
+// Defined after gocvm::VThread (needs current_panic_head()).
+Recovered recover();
 
 template<class F>
 class Defer {
@@ -415,12 +425,64 @@ Defer<F> defer(F f) {
   return Defer<F>(std::move(f));
 }
 
+// Forward declaration only: DeferList's core (Node/Impl/push/RunAll/
+// ~DeferList) must NOT actually require Task to be complete, or even
+// exist -- a program that never uses goroutines/channels anywhere at
+// all does not get Task/Chan/Scheduler compiled in (see
+// WASIGO_NEED_CORO below), but plain `defer` is completely independent
+// of that and must still work. Only a genuinely async defer (the
+// closure's own body uses channels) needs Task, and that can only
+// happen in a program where WASIGO_NEED_CORO ends up enabled anyway
+// (nothing else could compile that closure's body either) -- see
+// DeferList's own definition, right below, for how the split works.
+struct Task;
+
 // Function-scoped defer list so panic can be captured *before* defers run
-// (Go's order). RAII still owns the list; each `defer` is a push.
+// (Go's order). RAII still owns the list for the plain-synchronous case;
+// each `defer` is a push. A deferred call whose own body uses channels
+// (`defer func(){ <-ch }()`) is itself a Task-returning coroutine --
+// calling it and discarding the result (like a plain synchronous defer
+// would) abandons it suspended at its very first co_await, same hazard
+// go()-ing a bare `func(){...}()` literal has (see GoAsyncLit's own
+// comment) -- so it needs push_async()/AsyncImpl below instead of push().
+// From an ASYNC enclosing function, this MUST be driven via `co_await
+// __defers.RunAllAwait()` from the enclosing coroutine's own generated
+// code (an ordinary member function like RunAll()/~DeferList() cannot
+// co_await anything itself) -- see EmitReturnWithDefers's own async
+// branch in cpp_generator.cc. From a SYNC enclosing function (which
+// cannot co_await at all), AsyncImpl::run() below instead spawns the
+// closure as a real goroutine and pumps the scheduler with RunUntil()
+// until just that one finishes -- not wasigo::run() itself, which drains
+// EVERY pending goroutine, not just this defer's.
+//
+// Node::run_await() (the non-template virtual with a body) and
+// DeferList::RunAllAwait() are declared here but DEFINED LATER, after
+// Task actually exists (see the matching out-of-line definitions right
+// after struct Task) -- unlike Impl/AsyncImpl/push/push_async, which
+// are templates and so aren't type-checked until first instantiated
+// (always later in the same translation unit, from generated code that
+// comes after the whole runtime is inlined -- see AsyncImpl's own
+// comment). A non-template virtual function's BODY, in contrast, is
+// checked immediately at class-definition time, which is exactly why it
+// can't just return Task inline right here the way AsyncImpl's own
+// override can.
 struct DeferList {
   struct Node {
     virtual ~Node() = default;
     virtual void run() = 0;
+#ifdef WASIGO_NEED_CORO
+    // Only declared at all when Task exists in this translation unit
+    // (see WASIGO_NEED_CORO below) -- a program that needs no
+    // goroutines/channels anywhere never compiles Task in at all, and a
+    // virtual method returning it would leave Node's vtable needing a
+    // definition (Task complete, co_return and all) that could never
+    // exist in that TU, an unconditional link error even though nothing
+    // would ever call it. Every generated program that DOES push_async
+    // an async defer necessarily needs channels somewhere (that's what
+    // makes the deferred closure's own body async in the first place),
+    // so WASIGO_NEED_CORO is always on wherever this could matter.
+    virtual Task run_await();
+#endif
   };
   template<class F>
   struct Impl : Node {
@@ -428,18 +490,65 @@ struct DeferList {
     explicit Impl(F fn) : f(std::move(fn)) {}
     void run() override { f(); }
   };
+#ifdef WASIGO_NEED_CORO
+  // F, called, returns a Task (the deferred closure's own body uses
+  // channels). RunAllAwait() (an async enclosing function) calls
+  // run_await() directly; RunAll()/~DeferList() (a SYNC enclosing
+  // function, which cannot co_await at all) calls this run() instead --
+  // spawn the closure as a real goroutine and block, via RunUntil()
+  // (pumping the scheduler, not the OS thread -- other goroutines this
+  // one might rendezvous with, e.g. over a channel, still get to run),
+  // until just this one finishes. A template, so none of this is
+  // type-checked until push_async<F>() is actually instantiated, which
+  // can only happen from generated code using an async defer -- by then
+  // Task/go/RunUntil are all real (see the forward declarations above
+  // Task's own definition).
+  template<class F>
+  struct AsyncImpl : Node {
+    F f;
+    explicit AsyncImpl(F fn) : f(std::move(fn)) {}
+    void run() override;
+    Task run_await() override;
+  };
+#endif
   std::vector<std::unique_ptr<Node>> fns;
   template<class F>
   void push(F f) {
     fns.push_back(std::make_unique<Impl<F>>(std::move(f)));
   }
-  ~DeferList() {
+#ifdef WASIGO_NEED_CORO
+  template<class F>
+  void push_async(F f) {
+    fns.push_back(std::make_unique<AsyncImpl<F>>(std::move(f)));
+  }
+#endif
+  // Runs every deferred call now, LIFO, same order/logic as the
+  // destructor below -- needed at a `return`/`co_return` that has a
+  // named result a defer might modify (e.g. via recover()): the return
+  // statement's own operand is read/copied BEFORE any local's destructor
+  // runs (that's just how `return`/`co_return` are specified), so
+  // waiting for ~DeferList() to run the defers reads the named result's
+  // PRE-defer value -- too late. Calling this explicitly first, then
+  // reading the (now possibly-modified) named result, then returning it,
+  // gets the order real Go's own defer/named-result semantics require.
+  // Safe to call more than once: the second call, from the destructor
+  // once this object's own scope actually ends, finds `fns` already
+  // empty and does nothing. Sync-only -- see RunAllAwait() for a
+  // function with at least one async defer.
+  void RunAll() {
     while (!fns.empty()) {
       auto n = std::move(fns.back());
       fns.pop_back();
       n->run();
     }
   }
+#ifdef WASIGO_NEED_CORO
+  // The async counterpart, for a function with at least one async
+  // defer -- must itself be co_await'ed by the enclosing coroutine's own
+  // generated code (see this struct's own top comment for why).
+  Task RunAllAwait();
+#endif
+  ~DeferList() { RunAll(); }
 };
 
 // ---- error ------------------------------------------------------------------
@@ -2004,8 +2113,27 @@ struct VThread : gc::GarbageCollected<VThread> {
   // gocvm::OSThreadFor(id) below, which looks this same fact up by raw
   // numeric id without needing the VThread pointer.
   std::thread::id os_thread{};
+  // This goroutine's own panic/recover chain -- see current_panic_head()
+  // right below for why this needs to be per-VThread rather than a flat
+  // per-OS-thread chain. Points at a coroutine-frame-local (or plain
+  // C++-stack-local) PanicFrame, never a GC-heap object, so Trace()
+  // below correctly leaves it untouched.
+  PanicFrame* panic_head = nullptr;
   void Trace(gc::Visitor&) const override {}
 };
+
+// Meyer's-singleton function wrapper (see g_panic_frame's own comment
+// for why, applied here from the start). Whichever VThread the
+// scheduler is currently running -- set/restored around every resume in
+// Scheduler::run() and read at every point a goroutine parks itself
+// (Chan's awaiters, CallAsync) so the parked waiter can restore it
+// correctly next time -- nullptr when nothing spawned via go() is
+// currently executing (main() itself, or any synchronous call chain
+// that never suspends).
+inline VThread*& current_vthread() {
+  thread_local VThread* v = nullptr;
+  return v;
+}
 
 // MakeRooted, not Make()+a separate rooting step: the latter would
 // leave the freshly-allocated VThread visible to objects_ (so any
@@ -2091,6 +2219,40 @@ inline CallResult Call(const std::string& topic, const std::string& payload) {
 }
 
 }  // namespace gocvm
+
+// See current_vthread()'s own comment (just above, inside namespace
+// gocvm) for why panic/recover routes through whichever VThread is
+// currently running instead of a flat per-OS-thread chain.
+inline PanicFrame*& current_panic_head() {
+  if (gocvm::VThread* vt = gocvm::current_vthread()) return vt->panic_head;
+  return g_panic_frame();
+}
+
+inline PanicFrame::PanicFrame() : prev(current_panic_head()) { current_panic_head() = this; }
+
+inline PanicFrame::~PanicFrame() {
+  current_panic_head() = prev;
+  if (has_pending && !recovered) {
+    // If a bridge is active, promote to ErrorState rather than aborting.
+    if (g_error_state().is_bridge()) {
+      g_error_state().bridge_panic(std::move(pending));
+      return;
+    }
+    std::cerr << "panic: " << pending << "\n";
+    std::abort();
+  }
+}
+
+inline Recovered recover() {
+  PanicFrame* f = current_panic_head();
+  if (!f || !f->has_pending) return {};
+  f->recovered = true;
+  Recovered r;
+  r.ok = true;
+  r.msg = std::move(f->pending);
+  f->has_pending = false;
+  return r;
+}
 
 #if defined(WASIGO_GOCVM_BRIDGE) && WASIGO_GOCVM_BRIDGE
 // Defined by shim_sandbox (src/gocvm_bridge.cc), linked in only when
@@ -2257,19 +2419,38 @@ T* New() {
 // an unsynchronized ready queue wouldn't actually BE thread-safe end to
 // end, whatever locking Chan itself did.
 struct Scheduler {
-  std::deque<std::coroutine_handle<>> ready;
+  // The VThread paired with each handle is whichever goroutine owned it
+  // at the moment it parked/suspended (gocvm::current_vthread(), read at
+  // that point -- see Chan's awaiters and CallAsyncAwaiter::await_suspend
+  // below) or, for a brand-new go() spawn, the VThread just registered
+  // for it. Restored via gocvm::current_vthread() around each resume in
+  // run() below so panic/recover's own chain (current_panic_head(), see
+  // its comment) stays correctly scoped to whichever goroutine is
+  // actually executing, not whichever happened to run last on this OS
+  // thread. Null for a coroutine that isn't running as a spawned
+  // goroutine at all (shouldn't normally happen -- everything reaching
+  // the scheduler comes from go() one way or another -- but resuming
+  // with a null VThread is still safe: it just means panic/recover fall
+  // back to the flat per-OS-thread chain for that resume).
+  struct ReadyItem {
+    std::coroutine_handle<> h;
+    gocvm::VThread* vt = nullptr;
+  };
+  std::deque<ReadyItem> ready;
   std::atomic<int> parked{0};
   std::mutex ready_mu;
 
-  void enqueue(std::coroutine_handle<> h) {
+  void enqueue(std::coroutine_handle<> h, gocvm::VThread* vt = nullptr) {
     std::lock_guard<std::mutex> lk(ready_mu);
-    ready.push_back(h);
+    ready.push_back(ReadyItem{h, vt});
   }
-  // Non-blocking: false (leaves *out untouched) if nothing is ready.
-  bool try_dequeue(std::coroutine_handle<>* out) {
+  // Non-blocking: false (leaves *out_h/*out_vt untouched) if nothing is
+  // ready.
+  bool try_dequeue(std::coroutine_handle<>* out_h, gocvm::VThread** out_vt) {
     std::lock_guard<std::mutex> lk(ready_mu);
     if (ready.empty()) return false;
-    *out = ready.front();
+    *out_h = ready.front().h;
+    *out_vt = ready.front().vt;
     ready.pop_front();
     return true;
   }
@@ -2345,10 +2526,69 @@ struct Task {
     // Scheduler owns the frame until it completes; otherwise ~Task and
     // Scheduler::run both destroy it (heap corruption on MSVC).
     h.promise().detached = true;
-    scheduler().enqueue(h);
+    // gocvm::current_vthread() here, not h.promise().vthread: a nested
+    // (not go()-spawned directly) Task like this one never gets its own
+    // vthread set, but it's still executing AS PART OF whichever
+    // goroutine is currently running -- see Scheduler::ReadyItem's own
+    // comment.
+    scheduler().enqueue(h, gocvm::current_vthread());
   }
   void await_resume() {}
 };
+
+// Forward declarations: DeferList::AsyncImpl<F>::run() below (a SYNC,
+// non-async enclosing function can still defer an async closure -- Go
+// allows it, and nothing about a defer statement itself requires the
+// enclosing function to use channels) calls both -- go's own real
+// definition needs Scheduler, RunUntil's needs gocvm::detail's
+// completion draining, so both are defined later, only declared here.
+// RunUntil's own bool* argument has no associated namespace for ADL to
+// find it through at AsyncImpl<F>::run()'s instantiation point (unlike
+// go(Task), findable via Task's own namespace regardless of order), so
+// unlike Task itself, RunUntil genuinely needs this ordinary declaration
+// to be visible before that point, not just before instantiation.
+inline void go(Task t);
+void RunUntil(bool* done_flag);
+
+// Wraps a deferred async closure so DeferList::AsyncImpl::run() below
+// can spawn it as a real goroutine and know, via *done, exactly when to
+// stop pumping RunUntil() -- the closure itself never signals completion
+// any other way (it's just `F` returning a Task).
+template<class F>
+Task RunAsyncDeferGoroutine(F f, bool* done) {
+  co_await f();
+  *done = true;
+  co_return;
+}
+
+// Out-of-line now that Task actually exists -- see DeferList's own
+// definition, way above (before Task), for why these two non-template
+// members (unlike Impl/AsyncImpl/push/push_async, which are templates
+// and so aren't checked until instantiated) couldn't just have their
+// bodies written inline back there.
+inline Task DeferList::Node::run_await() {
+  run();
+  co_return;
+}
+inline Task DeferList::RunAllAwait() {
+  while (!fns.empty()) {
+    auto n = std::move(fns.back());
+    fns.pop_back();
+    co_await n->run_await();
+  }
+  co_return;
+}
+template<class F>
+void DeferList::AsyncImpl<F>::run() {
+  bool done = false;
+  go(RunAsyncDeferGoroutine(std::move(f), &done));
+  RunUntil(&done);
+}
+template<class F>
+Task DeferList::AsyncImpl<F>::run_await() {
+  co_await f();
+  co_return;
+}
 
 // Task with a result: a channel-using function that returns T becomes
 // TaskT<T> rather than Task (void). Same runqueue, same stackless frames.
@@ -2411,7 +2651,9 @@ struct TaskT {
   void await_suspend(std::coroutine_handle<> waiter) {
     h.promise().continuation = waiter;
     h.promise().detached = true;
-    scheduler().enqueue(h);
+    // See Task::await_suspend's identical comment on why current_vthread()
+    // and not h.promise().vthread.
+    scheduler().enqueue(h, gocvm::current_vthread());
   }
   T await_resume() { return std::move(h.promise().value); }
 };
@@ -2483,6 +2725,15 @@ inline AsyncHostBridge*& async_bridge_slot() {
 struct PendingAsyncCall {
   std::coroutine_handle<> handle;
   gc::Persistent<VThread> vthread;
+  // The awaiting goroutine's own VThread (gocvm::current_vthread() at
+  // the moment it parked -- see CallAsyncAwaiter::await_suspend below),
+  // NOT `vthread` above: that one tracks which real OS thread served
+  // THIS specific call (see OSThreadFor), a different concept that can
+  // in principle differ per call even for the same goroutine. Restored
+  // via Scheduler::ReadyItem when apply_completion() re-enqueues
+  // `handle` so panic/recover's chain (current_panic_head()) stays
+  // scoped to the right goroutine on resume.
+  VThread* owner = nullptr;
 };
 
 inline std::unordered_map<uint64_t, PendingAsyncCall>& pending_async_calls() {
@@ -2533,7 +2784,7 @@ inline void apply_completion(const AsyncHostBridge::Completion& c) {
   }
   it->second.vthread->state = VThread::State::kRunning;
   async_results()[c.id] = c;
-  scheduler().enqueue(it->second.handle);
+  scheduler().enqueue(it->second.handle, it->second.owner);
   pending_async_calls().erase(it);
 }
 
@@ -2594,6 +2845,7 @@ struct CallAsyncAwaiter {
     request_id = detail::async_bridge_slot()->Submit(topic, payload);
     auto& pc = detail::pending_async_calls()[request_id];
     pc.handle = h;
+    pc.owner = current_vthread();
     pc.vthread = gocvm::RegisterThread();
     pc.vthread->state = VThread::State::kAwaitingHost;
     vthread_id = pc.vthread->id;
@@ -2633,8 +2885,17 @@ inline CallAsyncAwaiter CallAsync(const std::string& topic, const std::string& p
 inline void Scheduler::run() {
   for (;;) {
     std::coroutine_handle<> h;
-    while (try_dequeue(&h)) {
+    gocvm::VThread* vt = nullptr;
+    while (try_dequeue(&h, &vt)) {
+      // See gocvm::current_vthread()'s own comment: this is the one
+      // place a goroutine switch actually happens, so it's the one
+      // place that needs to update it. Saved/restored (not just set)
+      // in case run() is ever re-entered while some outer resume is
+      // still on the C++ call stack.
+      gocvm::VThread* prev_vt = gocvm::current_vthread();
+      gocvm::current_vthread() = vt;
       h.resume();
+      gocvm::current_vthread() = prev_vt;
       if (h.done()) h.destroy();
       gocvm::detail::drain_async_completions();
     }
@@ -2647,11 +2908,39 @@ inline void Scheduler::run() {
   if (parked > 0) panic("fatal error: all goroutines are asleep - deadlock!");
 }
 
+// See DeferList::AsyncImpl::run()'s own comment for why this exists
+// instead of just calling wasigo::run(): that drains EVERY pending
+// goroutine, not just the one this specific defer is waiting on, which
+// would make a sync function's return implicitly block on unrelated
+// work it has no business waiting for. Same resume/vthread-restore
+// logic as Scheduler::run() above, just with a narrower stopping
+// condition (this one flag, not "nothing left anywhere").
+inline void RunUntil(bool* done_flag) {
+  while (!*done_flag) {
+    std::coroutine_handle<> h;
+    gocvm::VThread* vt = nullptr;
+    if (scheduler().try_dequeue(&h, &vt)) {
+      gocvm::VThread* prev_vt = gocvm::current_vthread();
+      gocvm::current_vthread() = vt;
+      h.resume();
+      gocvm::current_vthread() = prev_vt;
+      if (h.done()) h.destroy();
+      gocvm::detail::drain_async_completions();
+      continue;
+    }
+    if (gocvm::detail::has_pending_async()) {
+      gocvm::detail::block_until_async_completion();
+      continue;
+    }
+    panic("fatal error: all goroutines are asleep - deadlock!");
+  }
+}
+
 inline void go(Task t) {
   if (!t.h) return;
   t.h.promise().detached = true;
   t.h.promise().vthread = gocvm::RegisterThread();
-  scheduler().enqueue(t.h);
+  scheduler().enqueue(t.h, t.h.promise().vthread.get());
   t.h = {};
 }
 
@@ -2660,7 +2949,7 @@ void go(TaskT<T> t) {
   if (!t.h) return;
   t.h.promise().detached = true;
   t.h.promise().vthread = gocvm::RegisterThread();
-  scheduler().enqueue(t.h);
+  scheduler().enqueue(t.h, t.h.promise().vthread.get());
   t.h = {};
 }
 
@@ -2728,6 +3017,12 @@ struct Chan {
     std::shared_ptr<int> winner;
     int idx = -1;
     bool counted = true;
+    // The parking goroutine's own VThread (gocvm::current_vthread() at
+    // park time) -- restored via Scheduler::ReadyItem when
+    // complete_recv() below wakes this waiter, so panic/recover's chain
+    // stays scoped to the right goroutine on resume. See
+    // Scheduler::ReadyItem's own comment.
+    gocvm::VThread* owner = nullptr;
   };
   struct SendWaiter {
     std::coroutine_handle<> h{};
@@ -2736,6 +3031,8 @@ struct Chan {
     std::shared_ptr<int> winner;
     int idx = -1;
     bool counted = true;
+    // See RecvWaiter::owner's own comment.
+    gocvm::VThread* owner = nullptr;
   };
   // Real Go guarantees channels are safe for concurrent use by
   // multiple goroutines -- this is the one core data structure in this
@@ -2782,7 +3079,7 @@ struct Chan {
     if (w.slot) *w.slot = std::move(v);
     if (w.ok) *w.ok = ok;
     if (w.counted) scheduler().parked--;
-    scheduler().enqueue(w.h);
+    scheduler().enqueue(w.h, w.owner);
   }
 
   static void complete_send(SendWaiter& w) {
@@ -2790,7 +3087,7 @@ struct Chan {
     if (w.cancelled) *w.cancelled = true;
     if (w.winner) *w.winner = w.idx;
     if (w.counted) scheduler().parked--;
-    scheduler().enqueue(w.h);
+    scheduler().enqueue(w.h, w.owner);
   }
 
   // Caller must hold st->mu.
@@ -2862,13 +3159,13 @@ struct Chan {
   // lock" gap exists between the readiness check and the park.
   void park_recv_locked(std::coroutine_handle<> h, T* slot, bool* ok,
                         std::shared_ptr<bool> cancelled, std::shared_ptr<int> winner, int idx) {
-    st->recvs.push_back(
-        RecvWaiter{h, slot, ok, std::move(cancelled), std::move(winner), idx, /*counted=*/false});
+    st->recvs.push_back(RecvWaiter{h, slot, ok, std::move(cancelled), std::move(winner), idx,
+                                    /*counted=*/false, gocvm::current_vthread()});
   }
   void park_send_locked(std::coroutine_handle<> h, T value, std::shared_ptr<bool> cancelled,
                         std::shared_ptr<int> winner, int idx) {
     st->sends.push_back(SendWaiter{h, std::move(value), std::move(cancelled), std::move(winner), idx,
-                                   /*counted=*/false});
+                                   /*counted=*/false, gocvm::current_vthread()});
   }
 
   // Each plain awaiter below re-checks under st->mu inside
@@ -2885,7 +3182,8 @@ struct Chan {
     bool await_suspend(std::coroutine_handle<> h) {
       std::lock_guard<std::mutex> lk(ch->st->mu);
       if (ch->try_send_locked(value)) return false;
-      ch->st->sends.push_back(SendWaiter{h, std::move(value), nullptr, nullptr, -1, true});
+      ch->st->sends.push_back(
+          SendWaiter{h, std::move(value), nullptr, nullptr, -1, true, gocvm::current_vthread()});
       scheduler().parked++;
       return true;
     }
@@ -2903,7 +3201,8 @@ struct Chan {
     bool await_suspend(std::coroutine_handle<> h) {
       std::lock_guard<std::mutex> lk(ch->st->mu);
       if (ch->try_recv_locked(&value, &ok)) return false;
-      ch->st->recvs.push_back(RecvWaiter{h, &value, &ok, nullptr, nullptr, -1, true});
+      ch->st->recvs.push_back(
+          RecvWaiter{h, &value, &ok, nullptr, nullptr, -1, true, gocvm::current_vthread()});
       scheduler().parked++;
       return true;
     }
@@ -2918,7 +3217,8 @@ struct Chan {
     bool await_suspend(std::coroutine_handle<> h) {
       std::lock_guard<std::mutex> lk(ch->st->mu);
       if (ch->try_recv_locked(&value, &ok)) return false;
-      ch->st->recvs.push_back(RecvWaiter{h, &value, &ok, nullptr, nullptr, -1, true});
+      ch->st->recvs.push_back(
+          RecvWaiter{h, &value, &ok, nullptr, nullptr, -1, true, gocvm::current_vthread()});
       scheduler().parked++;
       return true;
     }
