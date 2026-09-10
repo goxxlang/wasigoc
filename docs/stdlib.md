@@ -8,6 +8,9 @@ fds, `time.Now`). One thread / no growable stacks still applies.
 **Status:** 4 builtins + 146 compiled packages. Everyday ported Go++
 source compiles. A package that can't exist on wasm32-wasip1 returns a
 clear "not supported" error or is marked n/a — it never fakes success.
+**wasigocvm** ([wasigocvm.md](wasigocvm.md)) is the web-native machine that
+gives `net` / `net/http` real sockets on wasm (gocvm + poll, not a WIT world).
+Stock wasip1 (`compile.bat`) still falls back to `net.Pipe`.
 
 Per-package notes, bounds, and the compiler bugs each package
 surfaced: [design-log.md](design-log.md) (tracker from
@@ -28,15 +31,18 @@ Host file I/O from a WASI guest should go through
 
 ## What WASI cannot do
 
-These compile and return a clear error. They are the terminal shape,
-not a todo: `os/exec`, `os/user`, `net.Dial` to a real host (loopback
-`Listen`/`Dial` `"tcp"` and `Pipe()` are real), `crypto/tls`,
-`syscall` (mutating), `runtime/trace`, `runtime/pprof` write half,
-`embed`.
+These compile and return a clear error on **wasm32-wasip1**. They are
+the terminal shape there, not a todo: `os/exec`, `os/user`, `net.Dial`
+to a real host (loopback `Listen`/`Dial` `"tcp"` and `Pipe()` are real
+via channels), `crypto/tls`, `syscall` (mutating), `runtime/trace`,
+`runtime/pprof` write half, `embed`.
+
+On **wasigo-p2**, `net`/`net/http` are real sockets (`gocvm` + `poll()`).
+`os/exec` / `crypto/tls` / `os/user` still need the native shim_sandbox
+host.
 
 `net.Pipe()` is the duplex [shim_sandbox](https://github.com/goxxlang/shim_sandbox) speaks.
-`net/http` is HTTP/1.0 over that stack (`Get`/`Post`/`Serve`/`ServeMux`),
-not sockets on the host.
+`net/http` is HTTP/1.0 over `net` (`Get`/`Post`/`Serve`/`ServeMux`).
 
 ## n/a on this target
 

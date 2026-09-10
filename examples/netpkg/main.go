@@ -13,13 +13,19 @@ func pipeWriter(c *net.Conn, done chan bool) {
 }
 
 func main() {
+	// External name: no DNS in the guest by default (wasigo-p2).
 	conn, err := net.Dial("tcp", "example.com:80")
 	fmt.Println(conn == nil)
 	fmt.Println(err != nil)
 
-	ln, err2 := net.Listen("tcp", ":8080")
+	// Loopback-only bind (web-native). Explicit 127.0.0.1 avoids
+	// leftover host listeners on bare ":port" from looking like success.
+	ln, err2 := net.Listen("tcp", "127.0.0.1:34567")
 	fmt.Println(ln == nil)
 	fmt.Println(err2 != nil)
+	if ln != nil {
+		ln.Close()
+	}
 
 	c := &net.Conn{}
 	_, err3 := c.Read(nil)
@@ -56,15 +62,22 @@ func main() {
 	_, readErr := b.Read(buf)
 	fmt.Println(readErr != nil)
 
-	// Userspace TCP: Dial matches Listen via Pipe.
-	ln2, _ := net.Listen("tcp", ":9090")
-	done2 := make(chan bool)
-	go acceptOnce(ln2, done2)
-	c2, derr := net.Dial("tcp", ":9090")
-	fmt.Println(derr == nil)
-	c2.Write([]byte("hi"))
-	c2.Close()
-	<-done2
+	ln2, lerr := net.Listen("tcp", "127.0.0.1:34568")
+	if lerr != nil {
+		fmt.Println(false)
+		fmt.Println("")
+	} else {
+		done2 := make(chan bool)
+		go acceptOnce(ln2, done2)
+		c2, derr := net.Dial("tcp", "127.0.0.1:34568")
+		fmt.Println(derr == nil)
+		if derr == nil {
+			c2.Write([]byte("hi"))
+			c2.Close()
+		}
+		<-done2
+		ln2.Close()
+	}
 
 	ua, ub := net.PacketPipe()
 	go udpSend(ua)
@@ -80,14 +93,20 @@ func main() {
 	fmt.Println(port)
 	fmt.Println(net.JoinHostPort("::1", "443"))
 
-	uln, _ := net.ListenPacket("udp", ":9100")
-	done3 := make(chan bool)
-	go udpListenOnce(uln, done3)
-	uc, uerr2 := net.DialPacket("udp", ":9100")
-	fmt.Println(uerr2 == nil)
-	uc.WriteTo([]byte("pong"), ":9100")
-	<-done3
-	uc.Close()
+	// Writer first, then reader goroutine — avoids parking ReadFrom alone
+	// on the cooperative poll bridge with nothing yet submitted to wake it.
+	uln, uerr3 := net.ListenPacket("udp", "127.0.0.1:34569")
+	uc, uerr2 := net.DialPacket("udp", "127.0.0.1:34569")
+	fmt.Println(uerr2 == nil && uerr3 == nil)
+	if uerr2 == nil && uerr3 == nil {
+		done3 := make(chan bool)
+		go udpListenOnce(uln, done3)
+		uc.WriteTo([]byte("pong"), "127.0.0.1:34569")
+		<-done3
+		uc.Close()
+	} else {
+		fmt.Println("")
+	}
 }
 
 func acceptOnce(ln *net.Listener, done chan bool) {
@@ -114,4 +133,3 @@ func udpListenOnce(c *net.PacketConn, done chan bool) {
 	c.Close()
 	done <- true
 }
-

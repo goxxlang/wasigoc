@@ -1,11 +1,14 @@
 // Package net: real TCP/UDP on a goclang++.bat --shim-sandbox build
 // (gocvm.Call -- see runtime.hpp's wasigo::gocvm and shim_sandbox's
 // src/sapi/real_win.cc), including a real Listener.Accept()/Conn that
-// actually moves bytes, not just a reachability probe. Under plain
-// wasm32-wasip1 (compile.bat), gocvm.Call itself reports no host
-// bridge and Dial/Listen fall back to the original userspace stack
-// below: TCP is net.Pipe (reliable duplex), UDP is length-prefixed
-// datagrams over a Pipe, both entirely local to this process.
+// actually moves bytes, not just a reachability probe. wasigocvm
+// (wasigocvm.bat) registers an in-module poll() bridge for the same
+// net.* topics against the wasigocvm sysroot sockets -- same Go++
+// source, no WIT wasi:sockets world. Under plain wasm32-wasip1
+// (compile.bat), gocvm.Call itself reports no host bridge and
+// Dial/Listen fall back to the original userspace stack below: TCP is
+// net.Pipe (reliable duplex), UDP is length-prefixed datagrams over a
+// Pipe, both entirely local to this process.
 //
 //   Dial("tcp", addr)           // real if a bridge is linked, else
 //                                // only matches a local Listen via Pipe

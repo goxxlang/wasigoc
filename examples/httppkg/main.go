@@ -15,19 +15,19 @@ func handleEcho(req *http.Request, resp *http.Response) {
 }
 
 func main() {
-	ln, err := net.Listen("tcp", ":8081")
+	ln, err := net.Listen("tcp", "127.0.0.1:34570")
 	fmt.Println(err == nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleRoot)
 	mux.HandleFunc("/echo", handleEcho)
 	go http.ServeHandler(ln, mux)
-	st, body, _ := http.Get(":8081", "/")
+	st, body, _ := http.Get("127.0.0.1:34570", "/")
 	fmt.Println(st)
 	fmt.Println(body)
-	st2, body2, _ := http.Post(":8081", "/echo", "hi")
+	st2, body2, _ := http.Post("127.0.0.1:34570", "/echo", "hi")
 	fmt.Println(st2)
 	fmt.Println(body2)
-	st3, body3, _ := http.Get(":8081", "/nope")
+	st3, body3, _ := http.Get("127.0.0.1:34570", "/nope")
 	fmt.Println(st3)
 	fmt.Println(body3)
 	ln.Close()

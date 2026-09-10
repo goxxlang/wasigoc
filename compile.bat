@@ -3,23 +3,35 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 rem compile.bat — build wasigoc (host) and optionally compile a Go++ program
-rem to wasm32-wasip1. Matches CMakeLists.txt and docs/build.md.
+rem to wasm32-wasip1 (noeh). For full-stack web-native (sockets, EH, Oilpan
+rem contract): wasigocvm.bat — see docs/wasigocvm.md.
 rem
 rem   compile.bat                         build wasigoc (Release)
 rem   compile.bat Debug                   build wasigoc (Debug)
-rem   compile.bat examples\hello\hello.go compile Go++ -> .wasm
+rem   compile.bat examples\hello\hello.go compile Go++ -> .wasm (wasip1)
 rem   compile.bat hello.go -o out.wasm    same, explicit wasm path
+rem   wasigocvm.bat httppkg.go            wasigocvm (not --wasip2)
 
 set "CONFIG=Release"
 set "GOFILE="
 set "OUTWASM="
 set "WASIGOC_EXTRA="
+set "WASI_PREVIEW=p1"
 
 :parse
 if "%~1"=="" goto :parsed
 if /I "%~1"=="-h" goto :usage
 if /I "%~1"=="--help" goto :usage
 if /I "%~1"=="/?" goto :usage
+if /I "%~1"=="--wasip2" (
+  echo error: --wasip2 is retired. Use wasigocvm.bat ^(full libc++ / WASIGO_GOCVM^).
+  echo        Stock wasip2-plus-noeh-flags is not the product — see docs\wasigocvm.md
+  exit /b 2
+)
+if /I "%~1"=="--wasigocvm" (
+  echo error: pass the .go file to wasigocvm.bat, not compile.bat --wasigocvm
+  exit /b 2
+)
 if /I "%~1"=="-o" (
   if "%~2"=="" (
     echo error: -o requires a path
@@ -79,7 +91,10 @@ exit /b %ERRORLEVEL%
 echo usage: compile.bat [Debug^|Release] [^<input.go^> [-o out.wasm] [wasigoc flags...]]
 echo.
 echo   no .go file   build the host compiler wasigoc.exe
-echo   input.go      transpile with wasigoc, then wasm32-wasip1-clang++
+echo   input.go      transpile with wasigoc, then wasm32-wasip1-clang++ (noeh)
+echo.
+echo For sockets / full libc++ / EH: wasigocvm.bat ^(docs\wasigocvm.md^).
+echo --wasip2 is retired; wasigocvm is the product, not stock wasip2 flags.
 echo.
 echo wasi-sdk is found at WASI_SDK_PATH, %%USERPROFILE%%\wasi-sdk, or
 echo the same search CMakeLists.txt uses. Do not use a bare
@@ -196,22 +211,28 @@ if not defined WASI_CLANG (
 )
 
 set "SYS=%WASI_ROOT%\share\wasi-sysroot"
+set "TRIPLE=wasm32-wasip1"
+if /I "%WASI_PREVIEW%"=="p2" set "TRIPLE=wasm32-wasip2"
 echo.
-echo [wasi-sdk] %WASI_CLANG%
+echo [wasi-sdk] %WASI_CLANG% (%TRIPLE%)
 echo            -o %OUTWASM%
 "%WASI_CLANG%" -O2 -std=c++20 -fno-exceptions ^
   -nostdinc++ ^
-  -isystem "%SYS%\include\wasm32-wasip1\noeh\c++\v1" ^
-  -isystem "%SYS%\include\wasm32-wasip1" ^
+  -isystem "%SYS%\include\%TRIPLE%\noeh\c++\v1" ^
+  -isystem "%SYS%\include\%TRIPLE%" ^
   -isystem "%SYS%\include" ^
   -I "%GO_DIR%" ^
+  -I "%~dp0src" ^
   -o "%OUTWASM%" "%GENCPP%"
 if errorlevel 1 (
-  echo wasm32-wasip1-clang++ failed
+  echo %TRIPLE%-clang++ failed
   exit /b 1
 )
 echo.
 echo wasm: %OUTWASM%
+if /I "%WASI_PREVIEW%"=="p2" (
+  echo run:  ..\shim_sandbox\tools\w2g-run.bat "%OUTWASM%"
+)
 exit /b 0
 
 :find_wasi_sdk
@@ -221,6 +242,10 @@ if defined WASI_SDK_PATH if exist "%WASI_SDK_PATH%\bin" set "WASI_ROOT=%WASI_SDK
 if not defined WASI_ROOT if exist "%USERPROFILE%\wasi-sdk\bin" set "WASI_ROOT=%USERPROFILE%\wasi-sdk"
 if not defined WASI_ROOT if exist "%HOME%\wasi-sdk\bin" set "WASI_ROOT=%HOME%\wasi-sdk"
 if not defined WASI_ROOT exit /b 0
-if exist "%WASI_ROOT%\bin\wasm32-wasip1-clang++.exe" set "WASI_CLANG=%WASI_ROOT%\bin\wasm32-wasip1-clang++.exe"
+if /I "%WASI_PREVIEW%"=="p2" (
+  if exist "%WASI_ROOT%\bin\wasm32-wasip2-clang++.exe" set "WASI_CLANG=%WASI_ROOT%\bin\wasm32-wasip2-clang++.exe"
+) else (
+  if exist "%WASI_ROOT%\bin\wasm32-wasip1-clang++.exe" set "WASI_CLANG=%WASI_ROOT%\bin\wasm32-wasip1-clang++.exe"
+)
 if not defined WASI_CLANG if exist "%WASI_ROOT%\bin\clang++.exe" set "WASI_CLANG=%WASI_ROOT%\bin\clang++.exe"
 exit /b 0

@@ -68,6 +68,18 @@
 #include <cstdlib>
 #include <dirent.h>
 #include <sys/stat.h>
+#if defined(WASIGO_GOCVM) && WASIGO_GOCVM
+#include "wasigocvm_config.hpp"
+// File-scope (not inside namespace wasigo): wasigocvm_net.hpp POSIX sockets.
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+extern "C" int close(int);
+#endif
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -2263,12 +2275,22 @@ inline Recovered recover() {
 extern "C" void wasigo_gocvm_install_bridge();
 #endif
 
+#if defined(WASIGO_GOCVM) && WASIGO_GOCVM && defined(WASIGO_NEED_CORO)
+namespace gocvm {
+void install_wasigocvm_net_bridge();
+}
+#endif
+
 inline void set_os_args(int argc, char** argv) {
   auto& a = os_args_store();
   a = make_slice<std::string>(argc < 0 ? 0 : argc);
   for (int i = 0; i < argc; ++i) a[i] = argv[i] ? argv[i] : "";
 #if defined(WASIGO_GOCVM_BRIDGE) && WASIGO_GOCVM_BRIDGE
   wasigo_gocvm_install_bridge();
+#elif defined(WASIGO_GOCVM) && WASIGO_GOCVM && defined(WASIGO_NEED_CORO)
+  // wasigocvm: in-module poll() net bridge, not WIT wasi:sockets.
+  // Native goclang++ still prefers shim_sandbox when both could apply.
+  gocvm::install_wasigocvm_net_bridge();
 #endif
 }
 
@@ -2881,6 +2903,10 @@ inline CallAsyncAwaiter CallAsync(const std::string& topic, const std::string& p
 }
 
 }  // namespace gocvm
+
+#if defined(WASIGO_GOCVM) && WASIGO_GOCVM
+#include "wasigocvm_net.hpp"
+#endif
 
 inline void Scheduler::run() {
   for (;;) {

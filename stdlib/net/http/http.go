@@ -1,4 +1,5 @@
-// Package http is HTTP/1.0 over the userspace net stack (Pipe-backed TCP).
+// Package http is HTTP/1.0 over net (Pipe on wasip1, real sockets on
+// wasigo-p2 / goclang++ --shim-sandbox).
 package http
 
 import (

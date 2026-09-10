@@ -1,0 +1,57 @@
+name: wasigocvm-toolchain
+
+# Builds a wasigocvm sysroot (wasi-sdk + exceptions) and uploads it as an
+# artifact. Consume on Windows by extracting into go++/toolchain/ and setting
+# WASIGO_TOOLCHAIN to that directory.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "toolchain/**"
+      - ".github/workflows/wasigocvm-toolchain.yml"
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git python3 ccache curl
+          # wasi-sdk's CMake refuses a non-Clang host compiler, and its
+          # exceptions support needs >=22 -- ubuntu-latest's default clang
+          # package isn't guaranteed to be new enough, so pull a pinned
+          # version from apt.llvm.org the same way toolchain/bootstrap.sh's
+          # own host-compiler search expects to find it (clang-22 first).
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 22
+
+      - name: Bootstrap wasigocvm sysroot
+        env:
+          CMAKE_GENERATOR: Ninja
+          WASIGO_BOOTSTRAP_JOBS: "4"
+        run: |
+          chmod +x toolchain/bootstrap.sh
+          ./toolchain/bootstrap.sh --jobs 4
+
+      - name: Pack toolchain (bin + sysroot + stamp)
+        run: |
+          cd toolchain
+          # bin/ only exists for a --dist build (see bootstrap.sh); the
+          # default `install` target this workflow runs doesn't produce it,
+          # so don't hard-fail packaging over its absence.
+          entries="wasigocvm-toolchain.json sysroot"
+          [ -d bin ] && entries="$entries bin"
+          [ -d share ] && entries="$entries share"
+          tar -czf ../wasigocvm-toolchain.tar.gz $entries
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasigocvm-toolchain
+          path: wasigocvm-toolchain.tar.gz
+          retention-days: 14

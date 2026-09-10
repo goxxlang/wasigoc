@@ -94,6 +94,20 @@ function with `defer` is a `goto` to that function's epilogue, not
 A program that uses `go` / `chan` / `select` gets
 `#define WASIGO_NEED_CORO 1` in the generated TU.
 
+## Compile with wasigocvm (full libc++)
+
+Own target: **eh libc++**, RTTI, Oilpan + type_key, gocvm sockets.
+Not stock wasip2 flag-tuning. Driver and sysroot:
+[wasigocvm.md](wasigocvm.md), [toolchain/README.md](../toolchain/README.md).
+
+```
+wasigocvm.bat examples\httppkg\main.go -o httppkg.wasm
+..\shim_sandbox\tools\w2g-run.bat httppkg.wasm
+```
+
+ctest: `*_wasigocvm` (`WASIGO_CXXLIB=full`, `-DWASIGO_GOCVM=1`).
+`compile.bat --wasip2` is retired.
+
 ## Compile a program natively (`goclang++`)
 
 `wasigoc`'s own output isn't wasm-specific -- the generated C++ is

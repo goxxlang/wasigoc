@@ -2496,6 +2496,26 @@ A program that uses `go` / `chan` / `select` gets `#define WASIGO_NEED_CORO 1`
 in the generated TU so `src/runtime.hpp` includes `<coroutine>` and the
 scheduler; programs that do not (hello, fib, structs) skip that.
 
+## wasigo-p2 → wasigocvm (2026-09-09)
+
+Hard fork of WASI preview 2 inside this design, not a WIT world. Product
+identity is now **wasigocvm** (`-DWASIGO_GOCVM=1`, `wasigocvm_net.hpp`,
+`wasigocvm.bat` / bootstrap under `toolchain/`). Stock `__wasip2__` is only
+a temporary clang/sysroot borrow. Goldens: `hello_wasigocvm`,
+`netpkg_wasigocvm`, `httppkg_wasigocvm`. Writeup: [wasigocvm.md](wasigocvm.md).
+
+`WASIGOCVM_HOST_BRIDGE` (`--host-bridge`) forwards the topics that
+categorically cannot run inside the wasm32 sandbox itself -- `os.exec.*`,
+`os.user`, `syscall.*`, `tls.dial` -- to a companion native
+`shim_sandbox/src/gocvm_host.cc` process over loopback TCP, real
+`W2gSapiHandle` underneath, no logic duplicated. Goldens:
+`hostbridge_native`/`_golden`/`_wasigocvm` (no bridge, the documented
+fallback) and `hostbridge_hostbridge` (real bridge, needs a PowerShell
+driver -- `tests/golden/run_hostbridge_golden.ps1` -- since a companion
+process has to be started between compiling and running the wasm, then
+torn down after; `check_wasm.cmake`'s single static COMMAND can't do that
+alone).
+
 ## License
 
 BSD-3-Clause.

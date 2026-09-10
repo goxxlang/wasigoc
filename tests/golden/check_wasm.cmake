@@ -26,8 +26,26 @@ if(WASMTIME AND NOT WASMTIME STREQUAL "WASMTIME-NOTFOUND")
   # name) get real WASI filesystem access under wasmtime's sandbox, instead
   # of failing every op with "cannot create file" -- harmless for goldens
   # that don't touch the filesystem at all.
+  # WASMTIME_WASI is an optional cmake list of -S keys (inherit-network;tcp)
+  # used by wasigo-p2 goldens that need wasi:sockets granted to the VM.
+  set(_wasi_s_flags)
+  if(DEFINED WASMTIME_WASI AND NOT WASMTIME_WASI STREQUAL "")
+    foreach(_k IN LISTS WASMTIME_WASI)
+      if(NOT _k STREQUAL "")
+        list(APPEND _wasi_s_flags -S "${_k}")
+      endif()
+    endforeach()
+  endif()
+  set(_wasm_w_flags)
+  if(DEFINED WASMTIME_WASM AND NOT WASMTIME_WASM STREQUAL "")
+    foreach(_k IN LISTS WASMTIME_WASM)
+      if(NOT _k STREQUAL "")
+        list(APPEND _wasm_w_flags -W "${_k}")
+      endif()
+    endforeach()
+  endif()
   execute_process(
-    COMMAND "${WASMTIME}" run --dir=.::. "${WASM_FILE}"
+    COMMAND "${WASMTIME}" run --dir=.::. -W timeout=30s ${_wasm_w_flags} ${_wasi_s_flags} "${WASM_FILE}"
     OUTPUT_VARIABLE actual_output
     RESULT_VARIABLE run_result
   )
