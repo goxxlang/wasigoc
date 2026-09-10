@@ -64,9 +64,17 @@ std::string CppIdent(const std::string& n) {
   // as a bare `namespace log {` collides with global ::log from <cmath> --
   // MSVC hard-errors on that, "'log': a symbol with this name already
   // exists and therefore this name cannot be used as a namespace name").
+  // "sync" joined this list only once this compiler was actually built on
+  // Linux for the first time: glibc's <unistd.h> declares a global
+  // `void sync(void)`, transitively pulled in by <atomic> (bits/
+  // atomic_wait.h) -- present in essentially every generated program that
+  // uses goroutines/channels at all -- so `namespace sync {}` for Go's own
+  // `sync` package failed with "redeclared as different kind of entity"
+  // on Linux specifically (mingw/MSVC have no such global, so this was
+  // invisible on Windows).
   if (n == "EOF" || n == "NULL" || n == "errno" || n == "stdin" || n == "stdout" ||
       n == "stderr" || n == "time" || n == "stat" || n == "random" || n == "log" ||
-      n == "rand" || n == "signal" || n == "syscall") {
+      n == "rand" || n == "signal" || n == "syscall" || n == "sync") {
     return n + "_";
   }
   return n;
@@ -574,6 +582,13 @@ class Generator {
   std::string pending_label_;
   std::vector<std::string> current_type_params_;
   std::map<std::string, std::string> pkg_alias_;
+  // Set only while emitting inside a struct's own member declarations (a
+  // field's type, or a method's return/param type) -- see
+  // TypeForStructContext/StructShadowsName's comments for why
+  // NamedCppType needs this to detect a shadowed same-package type
+  // reference at ANY nesting depth (Slice<T>, Map<K,V>, T*, ...), not
+  // just when that type appears directly.
+  const StructDecl* shadow_check_struct_ = nullptr;
 
   static std::string LoadRuntime() {
     std::ifstream in(WASIGO_RUNTIME_PATH, std::ios::binary);
@@ -1680,7 +1695,18 @@ class Generator {
     }
     std::string base;
     if (t->pkg.empty() || t->pkg == file_.package_name) {
-      base = NamedCppType(t->name);
+      // Qualify instead of the ordinary bare same-package rendering
+      // when this exact name is shadowed by a field/method of the
+      // struct currently being emitted -- see StructShadowsName's
+      // comment. Applies at ANY nesting depth (CppType's Slice/Map/
+      // Pointer/etc. cases all recurse back through NamedCppType for
+      // their element types), which is exactly why this lives here
+      // rather than at each individual call site.
+      if (shadow_check_struct_ && StructShadowsName(*shadow_check_struct_, t->name)) {
+        base = NamespacePrefix(file_.package_name) + CppIdent(t->name);
+      } else {
+        base = NamedCppType(t->name);
+      }
     } else if (LookupStruct(t->name, t->pkg) || LookupInterface(t->name, t->pkg) ||
                LookupAlias(t->name, t->pkg)) {
       base = QualName(t->pkg, t->name);
@@ -2201,30 +2227,47 @@ class Generator {
   std::string EmitExpr(const Expr& e) {
     NoteLoc(e);
     switch (e.kind) {
-      // The "LL" suffix matters beyond style: an `auto`-deduced declaration
-      // (e.g. `total := 0` -> `auto total = 0;`) would otherwise deduce a
-      // plain (32-bit) `int` from a bare literal, silently contradicting
-      // this compiler's own "Go's `int` is always 64-bit" mapping (see
-      // NamedCppType) the moment such a variable accumulates a value that
-      // overflows 32 bits.
+      // The INT64_C/UINT64_C wrapping matters beyond style, two ways.
+      // First, an `auto`-deduced declaration (e.g. `total := 0` ->
+      // `auto total = 0;`) would otherwise deduce a plain (32-bit) `int`
+      // from a bare literal, silently contradicting this compiler's own
+      // "Go's `int` is always 64-bit" mapping (see NamedCppType) the
+      // moment such a variable accumulates a value that overflows 32
+      // bits -- a literal suffix (LL/ULL) is required to fix that.
+      // Second, a HARDCODED "LL"/"ULL" suffix is wrong on Linux: mingw
+      // (LLP64: `long` is 32-bit) makes `int64_t` an alias for `long
+      // long`, so "LL" already matches there, but glibc (LP64: `long` is
+      // 64-bit) makes `int64_t` an alias for plain `long` instead --  a
+      // DISTINCT type from `long long` in template argument deduction
+      // even though both are 64 bits, so `slices::Contains(Slice<int64_t>,
+      // int64_t)` against a bare "2LL" literal failed to deduce T at all
+      // on Linux (found by actually building and running this compiler
+      // on Linux for the first time, not by inspection). INT64_C/
+      // UINT64_C (<cstdint>, transitively included via runtime.hpp)
+      // exist exactly for this: each expands to whatever literal suffix
+      // actually produces int64_t/uint64_t on the CURRENT platform,
+      // `long` or `long long` as appropriate, so the emitted literal's
+      // type always matches the type callers expect no matter which one
+      // int64_t aliases here.
+      //
       // A Go int LITERAL (as opposed to a negated one -- `-5` parses as
       // UnaryExpr(Minus, IntLit(5)), a separate node) is never negative
       // at the source level, so a negative `e.intval` here can only be
       // the bit-reinterpreted top half of the uint64 range (e.g. a hash
       // constant like 0xa54ff53a5f1d36f1, > INT64_MAX -- see the lexer's
-      // stoull-based decimal/hex parse). Printing that as a signed `LL`
-      // literal (e.g. "-6534734903238641935LL") is the right BIT
-      // PATTERN but the wrong C++ token: a signed literal narrowing-
-      // converts into a `uint64_t` brace-init list (`Slice<uint64_t>{...}`,
-      // exactly how every hash/crc table here is built) which is ill-
-      // formed under real narrowing-conversion rules, not just a
-      // warning. Printing the unsigned decimal value with a `ULL` suffix
-      // instead is correct either way: for a genuinely uint64-range
+      // stoull-based decimal/hex parse). Emitting that as a SIGNED
+      // literal narrowing-converts into a `uint64_t` brace-init list
+      // (`Slice<uint64_t>{...}`, exactly how every hash/crc table here is
+      // built) which is ill-formed under real narrowing-conversion
+      // rules, not just a warning -- UINT64_C of the unsigned decimal
+      // value is correct either way: for a genuinely uint64-range
       // constant it's the literal Go source meant, and for the ordinary
       // small/positive case this branch is never taken at all.
       case ExprKind::IntLit:
-        if (e.intval < 0) return std::to_string(static_cast<uint64_t>(e.intval)) + "ULL";
-        return std::to_string(e.intval) + "LL";
+        if (e.intval < 0) {
+          return "UINT64_C(" + std::to_string(static_cast<uint64_t>(e.intval)) + ")";
+        }
+        return "INT64_C(" + std::to_string(e.intval) + ")";
       case ExprKind::FloatLit: return FormatDouble(e.floatval);
       case ExprKind::ImagLit:
         return "wasigo::Complex128{0.0, " + FormatDouble(e.floatval) + "}";
@@ -2305,8 +2348,9 @@ class Generator {
         std::string result = e.strval == "&^"
                                   ? "(" + EmitExpr(*e.x) + " & ~" + EmitExpr(*e.y) + ")"
                                   : "(" + EmitExpr(*e.x) + " " + e.strval + " " + EmitExpr(*e.y) + ")";
-        // Every int LITERAL emits as a 64-bit `LL`/`ULL` C++ token
-        // regardless of its Go-level type (see EmitExpr's IntLit case),
+        // Every int LITERAL emits as an INT64_C/UINT64_C-wrapped, 64-bit
+        // C++ token regardless of its Go-level type (see EmitExpr's
+        // IntLit case),
         // so an arithmetic/bitwise/shift op on a NARROWER Go integer
         // type (int8/uint8/int16/uint16/int32/rune -- this compiler's
         // `int`/`uint`/`int64`/`uint64` are already 64-bit, so they need
@@ -5182,10 +5226,24 @@ class Generator {
   // comment for why the body is never emitted here.
   void EmitMethodDecl(const FuncDecl& fn) {
     bool async = IsAsyncMethod(fn.receiver_type, fn.name);
-    out_ << "  " << FuncCppType(fn, async) << " " << fn.name << "(";
+    // Same shadow-aware treatment EmitMethodOutOfLine below already
+    // applies, and for the identical reason (see TypeForStructContext's
+    // comment) -- this in-CLASS declaration needs it too, not just the
+    // out-of-line definition: GCC's -Wchanges-meaning rejects a bare
+    // same-named type reference outright once ANY sibling member shares
+    // that name (MSVC/clang tolerate it), found only once this compiler
+    // was actually built with GCC (on Linux) for the first time.
+    const StructDecl* sd = LookupStruct(fn.receiver_type);
+    std::string ret_type = (!async && fn.results.size() == 1)
+                                ? TypeForStructContext(fn.results[0].get(), sd)
+                                : FuncCppType(fn, async);
+    out_ << "  " << ret_type << " " << fn.name << "(";
     for (size_t i = 0; i < fn.params.size(); ++i) {
       if (i) out_ << ", ";
-      out_ << ParamCppType(fn.params[i]) << " " << CppIdent(fn.params[i].name);
+      std::string pt = fn.params[i].variadic
+                            ? ParamCppType(fn.params[i])
+                            : TypeForStructContext(fn.params[i].type.get(), sd);
+      out_ << pt << " " << CppIdent(fn.params[i].name);
     }
     out_ << ")";
     if (!fn.receiver_is_pointer) out_ << " const";
@@ -5215,47 +5273,82 @@ class Generator {
   // need a deferred buffer, since it's simply called later in Run()'s own
   // sequence (right after EmitStructDefs), the same way EmitFreeFuncDefs
   // already runs separately from EmitFreeFuncPrototypes.
-  // Elaborated-type-specifier ("struct Name" instead of bare "Name") for
-  // a plain Named-struct type used directly as a parameter or return type
-  // in an out-of-line member-function definition. At that point, ordinary
-  // unqualified lookup ALSO sees every sibling member of the class being
-  // defined (its declaration list, already fully emitted by
-  // EmitStructDefs earlier) -- so a method whose OWN name matches ANOTHER
-  // type's name (e.g. real Go's own `hash/maphash`: `Hash.Seed() Seed`
-  // sitting alongside `Hash.SetSeed(seed Seed)`) shadows that type for
-  // every OTHER out-of-line definition in the same struct: the compiler
-  // resolves the bare "Seed" in `SetSeed`'s parameter list to the method
-  // `Hash::Seed`, not the type, and errors ("non-standard syntax; use '&'
-  // to create a pointer to member"). An elaborated-type-specifier
-  // (`struct Seed`) always finds the TYPE regardless of what else that
-  // bare name would otherwise resolve to -- the standard, general C++ fix
-  // for exactly this "hidden by a non-type declaration" shape. Only
-  // applied to a DIRECT Named-struct parameter/return type, not one
-  // nested inside `Slice<T>`/`TaskT<T>`/a multi-result struct's own
-  // fields -- narrower than fully general, but covers the shape that
-  // actually broke building `hash/maphash` (an accessor method's name
-  // matching another type is common real Go style: `func (c *Config)
-  // Timeout() Timeout`-shaped APIs).
-  std::string ElaboratedParamOrReturnType(const TypeNode* t) {
+  // True if struct sd has a field OR method literally named `name` --
+  // meaning any BARE reference to a type ALSO named `name`, anywhere in
+  // sd's own member declarations (not just on that one field/method),
+  // is a real GCC error (-Wchanges-meaning): a member's own
+  // point-of-declaration permanently claims that identifier within the
+  // class's scope, retroactively invalidating any earlier bare use of
+  // the same-named type too, not merely the declaration that introduced
+  // the member (found via hash/maphash's `Hash{ seed Seed }` field
+  // sitting alongside a `Hash.Seed() Seed` method -- the field's own
+  // name "seed" doesn't collide, but its bare `Seed` TYPE reference
+  // still does, purely because the SIBLING method is named "Seed").
+  // MSVC/clang tolerate the bare form throughout; only GCC rejects it,
+  // so this was invisible before this compiler was actually built with
+  // GCC (on Linux) for the first time.
+  bool StructShadowsName(const StructDecl& sd, const std::string& name) const {
+    for (auto& f : sd.fields) {
+      if (f.name == name) return true;
+    }
+    for (auto& fn : file_.funcs) {
+      if (fn.has_receiver && fn.receiver_type == sd.name && fn.name == name) return true;
+    }
+    return false;
+  }
+
+  // Renders t for use inside struct sd's own member declarations (a
+  // field's type, or a method's return/param type). Two independent
+  // fixes for two independent GCC-only errors, both from real Go shapes
+  // in this project's own go/ast + go/types + hash/maphash + archive/zip
+  // ports (MSVC/clang tolerate every one of these; only GCC rejects
+  // them -- all invisible before this compiler was actually built with
+  // GCC, on Linux, for the first time):
+  //   1. A DIRECT Named-struct type gets an elaborated-type-specifier
+  //      ("struct Name") -- unconditional, regardless of shadowing (see
+  //      the original comment this replaced: a method/field whose OWN
+  //      name matches another type, e.g. `Hash.Seed() Seed`, hides that
+  //      type from ordinary lookup for every OTHER sibling declaration;
+  //      elaboration always finds the type regardless).
+  //   2. shadow_check_struct_ is set for the whole CppType(t) call, not
+  //      just a direct/one-pointer-deep reference, so NamedCppType's
+  //      same-package branch can also qualify a shadowed name buried
+  //      inside a Slice<T>/Map<K,V>/other template argument (e.g.
+  //      archive/zip's `Reader{ File []*File }` -- a field named "File"
+  //      holding a slice of *File hits the identical error one level of
+  //      nesting down from the direct cases elaboration alone handles).
+  // sd may be null (a free function has no enclosing struct to shadow
+  // into) -- StructShadowsName below always returns false in that case.
+  std::string TypeForStructContext(const TypeNode* t, const StructDecl* sd) {
+    const StructDecl* saved = shadow_check_struct_;
+    shadow_check_struct_ = sd;
     std::string base = CppType(t);
-    if (t && t->kind == TypeKind::Named && LookupStruct(t->name, t->pkg)) {
+    shadow_check_struct_ = saved;
+    const TypeNode* named = (t && t->kind == TypeKind::Named)                                       ? t
+                             : (t && t->kind == TypeKind::Pointer && t->elem &&
+                                t->elem->kind == TypeKind::Named)
+                                 ? t->elem.get()
+                                 : nullptr;
+    if (named && LookupStruct(named->name, named->pkg)) {
       return "struct " + base;
     }
     return base;
   }
+
 
   void EmitMethodOutOfLine(const FuncDecl& fn) {
     bool async = IsAsyncMethod(fn.receiver_type, fn.name);
     const StructDecl* recv_sd = LookupStruct(fn.receiver_type);
     std::string recv_type_name = recv_sd ? SelfTypeName(*recv_sd) : fn.receiver_type;
     std::string ret_type = (!async && fn.results.size() == 1)
-                                ? ElaboratedParamOrReturnType(fn.results[0].get())
+                                ? TypeForStructContext(fn.results[0].get(), recv_sd)
                                 : FuncCppType(fn, async);
     out_ << TemplatePrefix(fn) << ret_type << " " << recv_type_name << "::" << fn.name << "(";
     for (size_t i = 0; i < fn.params.size(); ++i) {
       if (i) out_ << ", ";
-      std::string pt = fn.params[i].variadic ? ParamCppType(fn.params[i])
-                                              : ElaboratedParamOrReturnType(fn.params[i].type.get());
+      std::string pt = fn.params[i].variadic
+                            ? ParamCppType(fn.params[i])
+                            : TypeForStructContext(fn.params[i].type.get(), recv_sd);
       out_ << pt << " " << CppIdent(fn.params[i].name);
     }
     out_ << ")";
@@ -5317,7 +5410,14 @@ class Generator {
       out_ << " {\n";
       for (auto& f : sd.fields) {
         if (f.embedded && f.type && f.type->kind == TypeKind::Named) continue;
-        out_ << "  " << CppType(f.type.get()) << " " << FieldCppName(sd.name, f.name) << "{};\n";
+        // TypeForStructContext, not bare CppType: a field's type can
+        // collide with another field/method's own name in this same
+        // struct (`type Kind int; ... { Kind Kind }`, `Type *Type`, or
+        // hash/maphash's `Hash{ seed Seed }` sitting next to a `Seed()`
+        // method) -- see that function's comment for why GCC (not
+        // MSVC/clang) rejects the bare form once that happens.
+        std::string field_type = TypeForStructContext(f.type.get(), &sd);
+        out_ << "  " << field_type << " " << FieldCppName(sd.name, f.name) << "{};\n";
       }
       out_ << "\n";
       for (auto& fn : file_.funcs) {
@@ -5567,7 +5667,10 @@ class Generator {
       return false;
     }
     try {
-      out_init = std::to_string(EvalConstI64(*g.init, g.iota_value)) + "LL";
+      // INT64_C, not a hardcoded "LL" suffix -- see EmitExpr's IntLit
+      // case for why a fixed "LL" mismatches int64_t on Linux (glibc's
+      // LP64 makes int64_t an alias for `long`, not `long long`).
+      out_init = "INT64_C(" + std::to_string(EvalConstI64(*g.init, g.iota_value)) + ")";
       return true;
     } catch (const GenError&) {
       return false;

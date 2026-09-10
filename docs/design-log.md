@@ -2136,6 +2136,113 @@ verified by hand outside the golden harness (`os/exec`'s golden tests all
 run bridge-less, same as every gocvm-backed package, so PATH search has
 no bridge-less path to cover in `ctest` at all).
 
+**2026-09-04 -- wasigoc itself built and run on real Linux for the first
+time (WSL2/Ubuntu 24.04, GCC 13.3), toward a POSIX HostBridge for
+shim_sandbox. Four real, general, previously-latent compiler bugs found
+and fixed -- none of them shim_sandbox-specific; all four block ANY
+attempt to build wasigoc or its generated output with GCC, independent
+of the POSIX-backend work that motivated looking.** wasigoc's own
+CMakeLists.txt already had zero Windows-specific code (confirmed by
+grep before touching anything), so this was a real portability *test*,
+not a rewrite. Built via a clean rsync copy onto WSL's native ext4
+filesystem (not `/mnt/c` directly) into a fresh `build-wsl` dir --
+`/mnt/c/Users/grego/WASIGo++`'s own root still carries a stale in-source
+`CMakeCache.txt` from an old Windows-mingw configure (already documented
+elsewhere in this file as unused), and CMake's own cache-consistency
+check refuses a fresh out-of-source config across the Windows/WSL path-
+format boundary when that stale cache is anywhere in the source tree --
+left untouched rather than risk it being relied on elsewhere.
+
+1. **`main.cc`'s `TryReadFile` treated a directory as a possibly-openable
+   file.** `module_loader.cc`'s `TryRoot` always tries a bare import
+   path as a file FIRST, falling back to listing it as a package
+   directory only if that fails. `std::ifstream` opening a directory
+   fails outright on Windows (`is_open()` false, so the fallback always
+   ran there) but SUCCEEDS on Linux/glibc, reading zero bytes -- every
+   directory-shaped package import (`examples/geom`, `stdlib/math`, ...)
+   resolved as an empty "file" instead of falling through to
+   `ListGoFiles`, failing with "expected 'package' but found end of
+   file" for the FIRST directory-shaped import in the whole build.
+   Fixed with an explicit `std::filesystem::is_directory` check before
+   ever trying `ifstream` -- makes the behavior identical (and
+   independently correct) on both platforms, rather than "accidentally
+   right on Windows because ifstream happens to fail there."
+2. **Every integer literal emitted a hardcoded `LL`/`ULL` C++ suffix,
+   silently platform-dependent.** mingw (Windows' LLP64 model: `long` is
+   32-bit) makes `int64_t` an alias for `long long`, so "LL" happens to
+   match there -- but glibc (Linux's LP64 model: `long` is already
+   64-bit) makes `int64_t` an alias for plain `long`, a DISTINCT type
+   from `long long` in template argument deduction even though both are
+   64 bits wide. `slices.Contains(xs, 2)`-shaped calls (any generic
+   `Slice<int64_t>` function called with a literal argument) failed to
+   deduce `T` at all on Linux. Fixed by wrapping every emitted literal in
+   `INT64_C(...)`/`UINT64_C(...)` (`<cstdint>`, already transitively
+   included via runtime.hpp) instead of a hardcoded suffix -- each macro
+   expands to whichever suffix actually produces `int64_t`/`uint64_t` on
+   the CURRENT platform, so the emitted literal's type always matches
+   what callers expect regardless of which underlying type `int64_t`
+   aliases.
+3. **`namespace sync {}` collided with glibc's global `void sync(void)`
+   (`<unistd.h>`, transitively pulled in by `<atomic>` -- present in
+   essentially every generated program using goroutines/channels at
+   all).** A namespace and a non-namespace entity can never share a name
+   in the same scope in C++, and reordering doesn't help (whichever
+   declaration comes second "redeclares" the first, either direction).
+   `CppIdent` (in `src/cpp_generator.cc`) already had a small reserved-
+   name list solving this EXACT class of problem for other packages
+   (`log`/`time`/`rand`/`stat`/`signal`/`syscall`, all colliding libc/
+   cmath globals, per that function's own pre-existing comment) --
+   `sync` was simply missing from it. One-line fix (add `"sync"` to the
+   list), not a new mechanism.
+4. **A struct member (field or method) sharing a name with another type
+   used bare anywhere else in that same struct's declarations triggers
+   GCC's `-Wchanges-meaning` as a hard error; MSVC/clang silently accept
+   the identical code.** Found in three real shapes, all genuine Go
+   idioms already present in this project's own ports before any POSIX
+   work touched them: this project's own `go/ast` (`type Kind int; ...
+   struct { Kind Kind }`), `go/types` (`Type *Type`), real Go's own
+   `hash/maphash` (`Hash{ seed Seed }` sitting next to a `Hash.Seed()
+   Seed` method -- the FIELD's name "seed" doesn't collide, but its bare
+   `Seed` type reference still does, purely because a DIFFERENT sibling
+   member is named "Seed"), and real Go's own `archive/zip`
+   (`Reader{ File []*File }` -- the same class of error one level of
+   generic-template nesting down, inside a `Slice<File*>`). The general,
+   root fix ended up living in ONE place despite the varied surface
+   shapes: `NamedCppType`'s same-package branch (the sole choke point
+   every `CppType` case -- direct, `Pointer`, `Slice`, `Map`, ... --
+   eventually recurses back through for an element's own type) now
+   checks a new `shadow_check_struct_` context pointer, set only while
+   emitting a struct's own field types or a method's return/param types
+   (`TypeForStructContext`), and fully qualifies (instead of the
+   ordinary bare same-package rendering) exactly when
+   `StructShadowsName` finds a field or method of that same struct
+   already using the colliding identifier -- reaching an arbitrary
+   nesting depth for free, since it's the actual emission choke point,
+   not a per-call-site pattern match. A narrower first attempt (checking
+   only whether a field's OWN name matched its OWN declared type) missed
+   the `hash/maphash`/`archive/zip` shapes entirely, since in both the
+   collision is between two DIFFERENT members, not a field and its own
+   type -- corrected before it shipped, by actually building on Linux
+   again and hitting both. Also generalized a pre-existing, narrower
+   elaborated-type-specifier fix (`ElaboratedParamOrReturnType`,
+   originally added only for out-of-line method definitions) to also
+   cover in-class method declarations and ordinary struct fields, which
+   had the identical unaddressed gap.
+
+Verified end to end, not just "it compiles": a full clean build of
+wasigoc plus its entire native-test suite (424 ninja targets, zero
+Windows-specific workarounds) on real Ubuntu 24.04/GCC 13.3, then
+`ctest` actually RUN there -- 143/143 `_native` tests passed (real
+compiled-program stdout compared against expected, same check tier the
+`_native` tests always were; no `wasi-sdk` configured in this WSL
+environment yet, so the `_golden`/wasmtime tier didn't run this round).
+Also reconfirmed the full Windows suite is unaffected by all four fixes:
+283/283, unchanged. Next: shim_sandbox's actual POSIX backend (real
+BSD sockets/`posix_spawn`/OpenSSL for the 8 gocvm topics) is the
+remaining, much larger piece of the POSIX HostBridge -- this round was
+entirely prerequisite compiler work the attempt surfaced, not that work
+itself.
+
 ### Tracker (`go list std` minus `internal/`)
 
 Status: **in** = present (see tables above; still partial), **todo** = not

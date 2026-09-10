@@ -31,6 +31,17 @@
 namespace {
 
 std::optional<std::string> TryReadFile(const std::string& path) {
+  // ifstream opening a directory fails outright on Windows (is_open()
+  // false) but SUCCEEDS on Linux/glibc, silently reading zero bytes --
+  // module_loader.cc's TryRoot tries a bare import path as a file before
+  // falling back to listing it as a package directory, so without this
+  // check a directory import ("examples/geom", "stdlib/math") resolved
+  // as an empty "file" on Linux instead of falling through to
+  // ListGoFiles, producing "expected 'package' but found end of file"
+  // for every directory-shaped package. Was invisible until this
+  // compiler was actually built and run on Linux for the first time.
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) return std::nullopt;
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) return std::nullopt;
   std::ostringstream ss;
